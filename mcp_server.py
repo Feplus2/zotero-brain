@@ -633,7 +633,13 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
         if item_key is None:
             return [TextContent(type="text", text=f"Zotero 导入失败: {title[:60]}")]
 
-        linked = "✅ linked_file" if pdf_path and pdf_path.exists() else "❌ 无附件"
+        # Check if PDF was archived (import_to_zotero moves pdf to data/papers/)
+        has_pdf = False
+        if pdf_path_str:
+            archive_name = paper_importer._safe_filename(paper)
+            archive_path = config.PAPERS_DIR / archive_name
+            has_pdf = archive_path.exists()
+        linked = "✅ linked_file" if has_pdf else "❌ 无附件（仅元数据）"
         col_info = f"\nCollection: {collection}" if collection else ""
         return [TextContent(type="text", text=f"✅ Zotero 导入成功\n- Key: {item_key}\n- 标题: {title[:60]}\n- 附件: {linked}{col_info}")]
 
