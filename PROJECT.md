@@ -186,7 +186,7 @@ MinerU OCR/VLM 解析 → 结构化 Markdown
 
 ---
 
-### Phase 4：工具解耦 + Zotero-First 设计 📋 已规划
+### Phase 4：工具解耦 + Zotero-First 设计 ✅ 完成
 
 **核心原则：**
 
@@ -195,86 +195,347 @@ MinerU OCR/VLM 解析 → 结构化 Markdown
 3. **砍掉 DeepSeek API** — Collection 命名由 Agent 翻译成英文 slug，不需要额外 API
 4. **工具职责单一** — 每个工具只做一件事，流程编排交给 Skill
 
-**当前工具问题诊断：**
+**Git 存档点：** `3c6050a` (2026-06-12) — Phase 1/1.5/2.5 完成后的初始 commit，Phase 4 改动前的安全快照。
 
-| 工具 | 问题 | 改法 |
-|------|------|------|
-| `fetch_and_ingest` | 下载+导入Zotero+解析+向量化四件事全揉一起 | **拆分为独立工具** |
-| `compare_papers` | 就是两次 search + 拼文本，Agent 自己做更灵活 | 删除 |
-| `get_bibtex` | 依赖 ChromaDB，论文没入库就找不到 | 改为从 Zotero API 拉 metadata（TBD：Agent 辅助写作时按语义推荐引用可能仍需知识库支持） |
-| `list_collections` | 列的是 ChromaDB collection，不是 Zotero 文件夹 | 改为同时返回 Zotero 文件夹 + ChromaDB collection，Agent 看全貌后才决定放哪 |
+---
 
-**新工具清单（12 个）：**
+#### 4.1 工具变更总览
 
-原 `fetch_and_ingest` 拆分为 3 个独立工具：
+**当前 10 个工具 → Phase 4 后 11 个工具：**
 
-| # | 工具 | 状态 | 说明 |
-|---|------|------|------|
-| 1 | `download_paper` | **新增** | 6 级瀑布下载 PDF，返回本地路径。纯下载，不碰 Zotero 不碰 ChromaDB |
-| 2 | `import_to_zotero` | **新增** | 将 PDF + metadata 导入 Zotero（创建条目 + linked_file 附件），指定文件夹。纯 Zotero 操作 |
-| 3 | `ingest_paper` | **重做** | 解析 PDF → chunk → embed → ChromaDB。接受 Zotero key 或本地 pdf_path，指定 collection |
+| # | 工具 | 变更 | 涉及文件 |
+|---|------|------|----------|
+| 1 | `download_paper` | 🆕 新增 | `paper_importer.py`（复用现有 `download_pdf()`） |
+| 2 | `import_to_zotero` | 🆕 新增 | `paper_importer.py`（复用现有 `import_to_zotero()`） |
+| 3 | `ingest_paper` | 🔄 重做 | `mcp_server.py`（加 `pdf_path` + `collection` 参数） |
+| 4 | `list_collections` | 🔄 重做 | `mcp_server.py` + `zotero_sync.py`（同时返回 Zotero 文件夹 + ChromaDB + 同步状态） |
+| 5 | `create_collection` | 🆕 新增 | `zotero_sync.py` + `vector_store.py`（同时创建 Zotero 文件夹 + ChromaDB collection） |
+| 6 | `search_papers` | ➖ 不变 | — |
+| 7 | `discover_papers` | ➖ 不变 | — |
+| 8 | `get_paper_chunks` | ➖ 不变 | — |
+| 9 | `expand_context` | ➖ 不变 | — |
+| 10 | `read_paper_full` | ➖ 不变 | — |
+| 11 | `get_bibtex` | 🔄 改造 | `mcp_server.py` + `zotero_sync.py`（Zotero 优先 + ChromaDB 语义推荐 fallback） |
 
-其余工具：
+**删除：**
+- ~~`compare_papers`~~ — Agent 用 `search_papers` + `read_paper_full` 自己做更灵活
+- ~~`fetch_and_ingest`~~ — 已拆分为 `download_paper` + `import_to_zotero` + `ingest_paper`
 
-| # | 工具 | 状态 | 说明 |
-|---|------|------|------|
-| 4 | `list_collections` | **重做** | 同时返回 Zotero 文件夹列表 + ChromaDB collection 列表 + 同步状态 |
-| 5 | `create_collection` | **新增** | 同时创建 Zotero 文件夹 + ChromaDB collection，Agent 提供中文名和英文 slug |
-| 6 | `search_papers` | 不变 | 语义搜索 |
-| 7 | `discover_papers` | 不变 | 学术搜索 |
-| 8 | `get_paper_chunks` | 不变 | 论文 chunk 目录 |
-| 9 | `expand_context` | 不变 | 上下文扩展 |
-| 10 | `read_paper_full` | 不变 | 读全文 |
-| 11 | `get_bibtex` | **改** | 从 Zotero API 拉 metadata 生成 BibTeX（TBD：是否需要知识库语义推荐支持） |
+---
 
-**删除：** `compare_papers`（Agent 用 search + read 自己做更好）、`fetch_and_ingest`（已拆分）
+#### 4.2 每个工具的详细设计
 
-**ChromaDB Collection 命名策略：**
+##### 4.2.1 `download_paper` 🆕
+
+**职责：** 纯下载 PDF，不碰 Zotero 不碰 ChromaDB。
+
+**参数：**
+```python
+{
+    "doi": str,           # 与 title 二选一，优先 doi
+    "title": str,         # 可选，用于 discover 找 DOI
+    "save_dir": str,      # 可选，默认 data/downloads/
+}
+```
+
+**返回：**
+```json
+{
+    "pdf_path": "F:/MyProjects/zotero-brain/data/downloads/doi_10_1038_xxx.pdf",
+    "source": "openalex",          # cache|openalex|unpaywall|core|arxiv|scihub|none
+    "paper": { ... }               # discover 返回的 metadata（title, doi, authors, year 等）
+}
+```
+
+**实现：**
+- `mcp_server.py` 中新增工具定义和 handler
+- 如果只有 `title`，先调 `paper_discovery.discover()` 找到 DOI
+- 复用 `paper_importer.download_pdf()` 的 6 级瀑布
+- 返回 PDF 路径 + 元数据，Agent 可以拿这个路径去做下一步（导入 Zotero 或 ingest）
+
+##### 4.2.2 `import_to_zotero` 🆕
+
+**职责：** 将 PDF + metadata 导入 Zotero，创建条目 + linked_file 附件。纯 Zotero 操作。
+
+**参数：**
+```python
+{
+    "title": str,           # 必填
+    "doi": str,             # 可选
+    "authors": [str],       # 可选，["Last First", ...]
+    "year": int,            # 可选
+    "abstract": str,        # 可选
+    "url": str,             # 可选
+    "pdf_path": str,        # 可选，本地 PDF 路径（创建 linked_file）
+    "collection": str,      # 可选，Zotero 文件夹中文名
+}
+```
+
+**返回：**
+```json
+{
+    "item_key": "ABC12345",
+    "collection": "钠电层状氧化物正极",
+    "linked_file": true
+}
+```
+
+**实现：**
+- 复用 `paper_importer.import_to_zotero()` 的逻辑
+- 接受完整 metadata（不再依赖 discover 的 paper dict 格式）
+- 去重：先按 DOI 在 Zotero 搜索，已存在则返回现有 key
+
+##### 4.2.3 `ingest_paper` 🔄 重做
+
+**职责：** 解析 PDF → chunk → embed → ChromaDB。
+
+**参数：**
+```python
+{
+    "zotero_key": str,      # Zotero key（从 Zotero 拉 PDF + metadata）
+    "pdf_path": str,        # 或 本地 PDF 路径（跳过 Zotero 下载）
+    "collection": str,      # 目标 Collection 中文名
+    "force": bool,          # 强制重新解析
+}
+```
+
+**变更点：**
+- 新增 `pdf_path` 参数 — Agent 可以先 `download_paper()` 再传路径进来，不必经过 Zotero
+- 新增 `collection` 参数 — 明确指定目标 Collection（不再依赖 Zotero item 的 collection_names）
+- `zotero_key` 和 `pdf_path` 二选一：
+  - `zotero_key`：从 Zotero 拉 metadata + 下载 PDF
+  - `pdf_path`：直接用本地文件，metadata 从 Zotero key 拉或从 PDF 文件名推断
+
+**实现：**
+- 修改 `_ingest_paper()` 内部函数，支持 `collection` 参数覆盖 `item["collection_names"]`
+
+##### 4.2.4 `list_collections` 🔄 重做
+
+**职责：** 同时返回 Zotero 文件夹列表 + ChromaDB collection 列表 + 同步状态。
+
+**返回格式：**
+```json
+{
+    "zotero_folders": [
+        {"key": "ABC123", "name": "钠电层状氧化物正极", "item_count": 45},
+        {"key": "DEF456", "name": "固态电解质", "item_count": 30}
+    ],
+    "chroma_collections": [
+        {"name": "sodium-layered-oxide-cathode", "display_name": "钠电层状氧化物正极", "chunks": 1234},
+        {"name": "solid-electrolyte", "display_name": "固态电解质", "chunks": 890}
+    ],
+    "sync_status": {
+        "钠电层状氧化物正极": {"zotero_key": "ABC123", "chroma_name": "sodium-layered-oxide-cathode", "synced": true},
+        "固态电解质": {"zotero_key": "DEF456", "chroma_name": "solid-electrolyte", "synced": true},
+        "新文件夹": {"zotero_key": "GHI789", "chroma_name": null, "synced": false}
+    }
+}
+```
+
+**实现：**
+- `zotero_sync.py` 新增 `list_folders()` 函数 — 返回 Zotero 文件夹 + 每个文件夹的论文数量
+- `mcp_server.py` 中合并两个列表，计算 sync_status
+- 通过 `collection_map.json` + ChromaDB collection metadata 中的 `display_name` 做映射
+
+##### 4.2.5 `create_collection` 🆕
+
+**职责：** 同时创建 Zotero 文件夹 + ChromaDB collection，Agent 提供中文名和英文 slug。
+
+**参数：**
+```python
+{
+    "folder_name": str,     # Zotero 文件夹中文名（如 "钠电层状氧化物正极"）
+    "chroma_name": str,     # ChromaDB 英文 slug（如 "sodium-layered-oxide-cathode"）
+}
+```
+
+**返回：**
+```json
+{
+    "zotero_folder_key": "ABC123",
+    "chroma_collection": "sodium-layered-oxide-cathode",
+    "message": "已创建: 钠电层状氧化物正极 ↔ sodium-layered-oxide-cathode"
+}
+```
+
+**实现：**
+- `zotero_sync.py` 新增 `create_folder(name)` — 调用 `zot.create_collections()`
+- `vector_store.py` 已有 `_get_collection()` 会自动创建
+- 映射关系写入 `collection_map.json` + ChromaDB collection metadata `zotero_folder_key` 字段
+- 校验 `chroma_name` 合法性（`[a-z0-9._-]`，3-512 字符）
+
+##### 4.2.6 `get_bibtex` 🔄 改造（保留知识库语义推荐）
+
+**职责：** 生成 BibTeX 引用 + 支持 Agent 辅助写作时的语义引用推荐。
+
+**设计决策：** 用户确认 Agent 辅助写作时按语义推荐引用非常重要，必须保留知识库支持。
+
+**双模式设计：**
+
+**模式 A — 精确引用（默认）：** Agent 已知要引用哪篇论文，提供 identifier
+```python
+{
+    "identifier": str,    # 论文标题、DOI 或 Zotero key
+    "mode": "exact",      # 默认
+}
+```
+- **优先从 Zotero API 拉 metadata**（通过 `zotero_sync.py` 的 `list_items()` 缓存 + DOI/标题/key 匹配）
+- 如果 Zotero 没有 → fallback 到 ChromaDB metadata
+- 如果都没有 → fallback 到 CrossRef API（通过 DOI 查）
+- 确保论文没入库（ChromaDB）也能生成 BibTeX（只要在 Zotero 里）
+
+**模式 B — 语义推荐（新增）：** Agent 正在辅助写作，需要根据内容推荐引用
+```python
+{
+    "query": str,          # 当前写作内容的描述或关键词
+    "mode": "recommend",   # 语义推荐模式
+    "n_results": int,      # 推荐数量，默认 5
+    "collections": [str],  # 可选，限定在特定 Collection 中推荐
+}
+```
+- 走 `search_papers()` 的语义搜索逻辑
+- 返回匹配的论文列表 + 每篇的 BibTeX
+- Agent 可以根据相关性选择引用哪些
+
+**返回格式（统一）：**
+```bibtex
+@article{wang_2024,
+  title={...},
+  author={...},
+  year={2024},
+  doi={10.1038/...},
+  journal={...}
+}
+```
+
+**实现：**
+- `zotero_sync.py` 新增 `get_item_metadata(identifier)` — 从 Zotero API 拉单篇论文完整 metadata（包括 journal、volume、pages 等 BibTeX 需要的字段）
+- `mcp_server.py` 中根据 `mode` 分发：
+  - `exact` → `get_item_metadata()` → 生成 BibTeX（Zotero 优先，ChromaDB fallback）
+  - `recommend` → `vector_store.search()` → 对每篇结果生成 BibTeX
+
+##### 4.2.7 删除 `compare_papers`
+
+- 从 `mcp_server.py` 中移除工具定义和 handler
+- Agent 可以用 `search_papers` + `read_paper_full` 自行组合做对比，更灵活
+
+##### 4.2.8 删除 `fetch_and_ingest`
+
+- 从 `mcp_server.py` 中移除工具定义和 handler
+- 功能已由 `download_paper` + `import_to_zotero` + `ingest_paper` 三个工具覆盖
+
+---
+
+#### 4.3 砍掉 DeepSeek 依赖
+
+**涉及文件：** `config.py`
+
+**当前状态：**
+```python
+DEEPSEEK_API_KEY = _e("DEEPSEEK_API_KEY")
+DEEPSEEK_BASE_URL = _e("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+DEEPSEEK_MODEL = "deepseek-v4-pro"
+```
+
+**改动：**
+1. 删除 `DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL` 三个变量
+2. `translate_collection_name()` 不再调 DeepSeek 翻译 → 改为纯查映射表：
+   ```python
+   def translate_collection_name(chinese_name: str) -> str:
+       """中文 Collection 名 → ChromaDB 安全名（查映射表）"""
+       if not chinese_name or chinese_name == "uncategorized":
+           return "uncategorized"
+       if chinese_name in _NAME_MAP:
+           return _NAME_MAP[chinese_name]
+       # 未找到映射 → 报错，要求先用 create_collection 创建
+       raise ValueError(
+           f"Collection '{chinese_name}' 未找到映射。"
+           f"请先用 create_collection(folder_name='...', chroma_name='english-slug') 创建。"
+       )
+   ```
+3. `create_collection` 工具负责写入映射（Agent 提供英文 slug，不需要 API 翻译）
+4. 现有 `collection_map.json` 中的映射数据保留（向后兼容已入库的论文）
+
+---
+
+#### 4.4 ChromaDB Collection 命名策略
 
 - ChromaDB 只接受 `[a-zA-Z0-9._-]`，不支持中文
 - **砍掉 DeepSeek**，由 Agent 翻译英文 slug（Skill 指导命名规范）
-- `create_collection(folder="钠电层状氧化物正极", chroma_name="sodium-layered-oxide-cathode")` 一步到位
-- 映射关系存储在 ChromaDB collection metadata 中（`zotero_folder` 字段）
-- 所有接收 collection 参数的工具统一按 Zotero 文件夹名查找，内部查映射表得到 ChromaDB name
+- `create_collection(folder_name="钠电层状氧化物正极", chroma_name="sodium-layered-oxide-cathode")` 一步到位
+- 映射关系存储在：
+  - `data/collection_map.json`（向后兼容，快速查找）
+  - ChromaDB collection metadata 中新增 `zotero_folder_key` 字段（双向关联）
+- 所有接收 `collection` 参数的工具统一按 Zotero 文件夹名查找，内部查映射表得到 ChromaDB name
 
-**Skill 串联流程：**
+---
+
+#### 4.5 Skill 串联流程
 
 ```
 场景 A: "帮我找最新的钠电正极论文并入库"
-  1. list_collections() → 看用户有哪些 Zotero 文件夹
+  1. list_collections() → 看用户有哪些 Zotero 文件夹 + 同步状态
   2. discover_papers(query="...") → 搜论文
   3. Agent 判断论文属于哪个文件夹（语义匹配）
-     - 匹配上了 → fetch_and_ingest(folder="钠电层状氧化物正极")
+     - 匹配上了 → download_paper(doi=...) → import_to_zotero(collection="钠电层状氧化物正极") → ingest_paper(zotero_key=...)
      - 没匹配上 → 问用户："这篇放哪个文件夹？还是新建一个？"
-     - 用户想新建 → create_collection(folder="新名字", chroma_name="english-slug")
+     - 用户想新建 → create_collection(folder_name="新名字", chroma_name="english-slug")
   4. search_papers() → 验证入库成功
 
 场景 B: "我已经有这篇论文的 PDF 了，帮我入库"
   1. list_collections() → 看有哪些文件夹
   2. Agent 判断放哪个文件夹，不确定就问用户
-  3. ingest_paper(pdf_path="C:/.../paper.pdf", folder="钠电层状氧化物正极")
+  3. import_to_zotero(title=..., pdf_path="C:/.../paper.pdf", collection="钠电层状氧化物正极")
+  4. ingest_paper(pdf_path="C:/.../paper.pdf", collection="钠电层状氧化物正极")
 
-场景 C: "只下载到 Zotero，先不入库"
-  1. fetch_and_ingest(doi="...", folder="...", skip_ingest=true)
+场景 C: "只下载到本地，先不入库"
+  1. download_paper(doi="...") → 返回 PDF 路径
+  2. 用户随时可以：import_to_zotero(...) + ingest_paper(...)
 
 场景 D: 首次批量入库（run_ingest.py）
   1. 遍历 Zotero 所有文件夹
-  2. 每个文件夹自动创建对应 ChromaDB collection（Agent 提供翻译或自动 slug 化）
+  2. 每个文件夹检查 ChromaDB 是否有对应 collection → 没有则 create_collection()
   3. 按文件夹逐个 ingest
+
+场景 E: Agent 辅助写作（语义引用推荐）
+  1. get_bibtex(query="关于 LLZO 电解质界面稳定性的讨论", mode="recommend", n_results=5)
+  2. 返回 5 篇最相关论文 + 每篇的 BibTeX
+  3. Agent 根据上下文选择引用哪些
 ```
 
-**实现步骤：**
+---
 
-1. 砍 DeepSeek：`config.py` 删除 DEEPSEEK_* 配置，`translate_collection_name` 改为查映射表
-2. 改 `list_collections`：调 Zotero API 返回文件夹列表，附带 ChromaDB 同步状态
-3. 新增 `create_collection`：同时创建 Zotero 文件夹 + ChromaDB collection
-4. 改 `fetch_and_ingest`：加 `skip_ingest` 参数
-5. 改 `ingest_paper`：加 `pdf_path` 参数
-6. 改 `get_bibtex`：从 Zotero API 拉 metadata
-7. 删 `compare_papers`
-8. 改 `run_ingest.py`：按 Zotero 文件夹自动对齐 ChromaDB collection
-9. 写 Skill（SKILL.md）：指导 Agent 使用这套工具的工作流
-10. 更新 README.md + PROJECT.md
+#### 4.6 实施步骤（按顺序执行）
+
+| 步骤 | 改动 | 文件 | 预计影响 |
+|------|------|------|----------|
+| **Step 1** | git commit 存档 | .git | ✅ 已完成 (commit `3c6050a`) |
+| **Step 2** | 砍 DeepSeek：删除 DEEPSEEK_* 配置，`translate_collection_name()` 改为纯查映射表 | `config.py` | 低风险，映射表已有数据 |
+| **Step 3** | `zotero_sync.py` 新增 `list_folders()` + `create_folder()` + `get_item_metadata()` | `zotero_sync.py` | 新增函数，不影响现有 |
+| **Step 4** | `vector_store.py` 新增 `create_collection()` 函数（含 metadata 写入） | `vector_store.py` | 新增函数 |
+| **Step 5** | 重写 `mcp_server.py` 工具层：新增 3 个工具 + 改 3 个工具 + 删 2 个工具 | `mcp_server.py` | **核心改动** |
+| **Step 6** | 改 `run_ingest.py`：按 Zotero 文件夹自动对齐 ChromaDB collection | `run_ingest.py` | 小改 |
+| **Step 7** | `py_compile` 全部 .py 文件语法检查 | 所有 | 验证 |
+| **Step 8** | 写 Skill（SKILL.md）：指导 Agent 使用这套工具的工作流 | 新建 | 用户侧 |
+| **Step 9** | git commit Phase 4 改动 | .git | 存档 |
+| **Step 10** | 更新 README.md + PROJECT.md | 文档 | 最后更新 |
+
+---
+
+#### 4.7 进度表
+
+| 步骤 | 状态 |
+|------|------|
+| Step 1: git 存档 | ✅ |
+| Step 2: 砍 DeepSeek | ✅ |
+| Step 3: zotero_sync 新函数 | ✅ |
+| Step 4: vector_store 新函数 | ✅ |
+| Step 5: mcp_server 工具层重写 | ✅ |
+| Step 6: run_ingest 改造 | ✅ |
+| Step 7: 语法检查 | ✅ 全部 12 个 .py 通过 |
+| Step 8: Skill 编写 | ✅ ~/.workbuddy/skills/zotero-brain/ |
+| Step 9: git commit | ⏳ |
+| Step 10: 文档更新 | ✅ |
 
 **预估工作量**：1 个会话
 

@@ -31,9 +31,6 @@ ZOTERO_USER_ID = _e("ZOTERO_USER_ID")
 ZOTERO_API_KEY = _e("ZOTERO_API_KEY")
 ZOTERO_LIBRARY_TYPE = _e("ZOTERO_LIBRARY_TYPE", "user")  # "user" or "group"
 DEFAULT_COLLECTION = "uncategorized"  # Papers not belonging to any Collection
-DEEPSEEK_API_KEY = _e("DEEPSEEK_API_KEY")
-DEEPSEEK_BASE_URL = _e("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-DEEPSEEK_MODEL = "deepseek-v4-pro"  # Official docs: https://api-docs.deepseek.com
 MINERU_TOKEN = _e("MINERU_TOKEN")
 MINERU_MODEL = "vlm"
 ZHIPU_API_KEY = _e("ZHIPU_API_KEY")
@@ -61,7 +58,7 @@ ZHIPU_MAX_CHARS = 6000     # Safe truncation for ~3072 tokens
 # -- Collection name mapping --
 # ChromaDB naming rules: 3-512 chars, [a-z0-9._-], must start/end with a-z0-9
 # Chinese name -> kebab-case English (Chinese name stored in metadata as display_name)
-# Automatically loads cache at runtime, translated by DeepSeek V4 Flash on first access
+# Phase 4: DeepSeek 已砍掉，映射由 Agent 通过 create_collection 工具写入
 _NAME_MAP_FILE = DATA_DIR / "collection_map.json"
 
 def _load_name_map() -> dict:
@@ -75,49 +72,29 @@ def _save_name_map(m: dict):
 _NAME_MAP = _load_name_map()
 
 def translate_collection_name(chinese_name: str) -> str:
-    """中文 Collection 名 → ChromaDB 安全名（DeepSeek V4 Flash 翻译）"""
+    """中文 Collection 名 → ChromaDB 安全名（纯查映射表，不再调 DeepSeek）"""
     if not chinese_name or chinese_name == "uncategorized":
         return "uncategorized"
     if chinese_name in _NAME_MAP:
         return _NAME_MAP[chinese_name]
-
-    import httpx
-    prompt = (
-        f"Translate this Chinese phrase to a short English kebab-case identifier "
-        f"(lowercase, hyphens, max 40 chars, no spaces). Only output the identifier.\n\n"
-        f"Input: {chinese_name}"
+    # 未找到映射 → 报错，要求先用 create_collection 创建
+    raise ValueError(
+        f"Collection '{chinese_name}' 未找到映射。"
+        f"请先用 create_collection(folder_name='...', chroma_name='english-slug') 创建。"
     )
-    try:
-        resp = httpx.Client(proxy=None, trust_env=False, timeout=30).post(
-            f"{DEEPSEEK_BASE_URL}/chat/completions",
-            headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
-            json={
-                "model": "deepseek-v4-flash",  # Cheap and fast, suitable for translation
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 512,  # V4 Flash is a reasoning model; reasoning + output need sufficient budget
-                "temperature": 0,
-            },
+
+def register_collection_mapping(chinese_name: str, chroma_name: str):
+    """注册中文名 → ChromaDB 英文名的映射（由 create_collection 工具调用）"""
+    import re
+    # 校验 chroma_name 合法性
+    if not re.match(r'^[a-z0-9][a-z0-9._-]{1,510}[a-z0-9]$', chroma_name):
+        raise ValueError(
+            f"ChromaDB 名称 '{chroma_name}' 不合法。"
+            f"要求: 3-512 字符, [a-z0-9._-], 首尾必须 a-z0-9"
         )
-        resp.raise_for_status()
-        result = resp.json()["choices"][0]["message"]["content"].strip().strip('"').lower()
-        # Clean illegal characters
-        import re
-        result = re.sub(r"[^a-z0-9._-]", "-", result)
-        result = re.sub(r"-+", "-", result).strip("-")
-        if len(result) < 3:
-            result = f"col-{result}"
-        _NAME_MAP[chinese_name] = result
-        _save_name_map(_NAME_MAP)
-        logger.info(f"Collection 翻译: '{chinese_name}' → '{result}'")
-        return result
-    except Exception as e:
-        logger.warning(f"翻译失败 ({chinese_name}): {e}, 使用 hash")
-        import hashlib
-        h = hashlib.md5(chinese_name.encode()).hexdigest()[:10]
-        result = f"col-{h}"
-        _NAME_MAP[chinese_name] = result
-        _save_name_map(_NAME_MAP)
-        return result
+    _NAME_MAP[chinese_name] = chroma_name
+    _save_name_map(_NAME_MAP)
+    logger.info(f"Collection 映射已注册: '{chinese_name}' → '{chroma_name}'")
 
 def get_display_name(chroma_name: str) -> str:
     """ChromaDB 名 → 中文显示名（反向查找）"""
