@@ -171,10 +171,11 @@ def parse_pdf(
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
-    # Cache directory
+    # Cache directory: always use item_key, cache filename = {key}.md
+    # This way ingest from different PDF paths (downloads/papers/storage) all share the same cache
     cache_dir = config.PARSED_DIR / (item_key or pdf_path.stem)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_md = cache_dir / f"{pdf_path.stem}.md"
+    cache_md = cache_dir / f"{item_key or pdf_path.stem}.md"
 
     # Check cache
     if cache_md.exists() and not force:

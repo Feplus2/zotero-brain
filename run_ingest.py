@@ -67,9 +67,12 @@ def _get_already_ingested() -> set[str]:
 
 
 def _has_cached_parse(item_key: str, pdf_path: Path) -> bool:
-    """检查是否有缓存的解析结果"""
-    cache_md = config.PARSED_DIR / item_key / f"{pdf_path.stem}.md"
-    return cache_md.exists()
+    """检查是否有缓存的解析结果（key 命名优先，向后兼容 stem 命名）"""
+    if (config.PARSED_DIR / item_key / f"{item_key}.md").exists():
+        return True
+    if (config.PARSED_DIR / item_key / f"{pdf_path.stem}.md").exists():
+        return True
+    return False
 
 
 def _ensure_collection_mapping(col_name: str) -> None:

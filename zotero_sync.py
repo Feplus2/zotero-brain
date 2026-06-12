@@ -226,68 +226,63 @@ def download_pdf(
     save_dir: Path | None = None,
 ) -> Path | None:
     """
-    获取论文的 PDF 附件
+    获取论文的 PDF 路径（不复制，直接返回原始路径）。
 
-    优先从本地 Zotero storage 复制（速度快、不依赖云端同步），
-    本地找不到时才尝试 API 下载。
+    查找顺序:
+      1. Zotero linked_file 附件路径（data/papers/ 永久存储）
+      2. parsed/{key}/{key}.md 旧缓存（向后兼容，PDF 可能已不存在）
+      3. Zotero 本地 storage（~/Zotero/storage/）
+      4. Zotero API 云端下载（→ 存到 data/papers/）
 
     Args:
         item_key: 论文的 Zotero key
-        save_dir: 保存目录，默认 parsed/{item_key}/
+        save_dir: (废弃，保留参数兼容)
 
     返回: PDF 文件路径，或 None（获取失败）
     """
     if zot is None:
         zot = _get_client()
 
-    if save_dir is None:
-        save_dir = config.PARSED_DIR / item_key
-    save_dir.mkdir(parents=True, exist_ok=True)
-
-    pdf_keys = get_item_pdf_keys(zot, item_key)
-    if not pdf_keys:
-        logger.warning(f"论文 {item_key} 没有 PDF 附件")
-        return None
-
-    pdf_key = pdf_keys[0]  # 取第一个 PDF
-    pdf_path = save_dir / f"{item_key}.pdf"
-
-    if pdf_path.exists():
-        logger.info(f"PDF 已存在: {pdf_path}")
-        return pdf_path
-
-    # === Strategy 1: Copy from local Zotero storage ===
-    local_dir = config.ZOTERO_LOCAL_STORAGE / pdf_key
-    if local_dir.is_dir():
-        # Find the first .pdf file in the directory
-        for f in local_dir.iterdir():
-            if f.suffix.lower() == ".pdf":
-                shutil.copy2(f, pdf_path)
-                logger.info(f"PDF 已从本地复制: {f.name} → {pdf_path}")
-                return pdf_path
-
-    # === Strategy 2: Fallback to API download (only works for cloud-synced attachments) ===
-    try:
-        zot.dump(pdf_key, str(save_dir))
-        for f in save_dir.iterdir():
-            if f.suffix == ".pdf" and f.name != pdf_path.name:
-                f.rename(pdf_path)
-                break
-        if pdf_path.exists():
-            logger.info(f"PDF 已从云端下载: {pdf_path}")
-            return pdf_path
-    except Exception as e:
-        logger.debug(f"API 下载也失败: {e}")
-
-    # === Strategy 3: Check linked_file attachments ===
+    # === 1. Zotero linked_file 附件路径（data/papers/ 永久存储）===
     linked_path = _get_linked_file_path(zot, item_key)
     if linked_path and Path(linked_path).exists():
-        # Copy linked file to parsed/ dir so it behaves like a normal attachment
-        shutil.copy2(linked_path, pdf_path)
-        logger.info(f"PDF 已从 linked_file 复制: {linked_path} → {pdf_path}")
-        return pdf_path
+        logger.info(f"PDF found via linked_file: {linked_path}")
+        return Path(linked_path)
 
-    logger.error(f"无法获取 PDF: {item_key} (本地 {local_dir} 不存在，云端 404，linked_file 也没有)")
+    # === 2. parsed/{key}/ 旧缓存中的 PDF（向后兼容）===
+    parsed_dir = config.PARSED_DIR / item_key
+    if parsed_dir.is_dir():
+        for f in parsed_dir.glob("*.pdf"):
+            if f.stat().st_size > 1000:
+                logger.info(f"PDF found in parsed cache: {f}")
+                return f
+
+    # === 3. Zotero 本地 storage ===
+    pdf_keys = get_item_pdf_keys(zot, item_key)
+    if pdf_keys:
+        pdf_key = pdf_keys[0]
+        local_dir = config.ZOTERO_LOCAL_STORAGE / pdf_key
+        if local_dir.is_dir():
+            for f in local_dir.iterdir():
+                if f.suffix.lower() == ".pdf":
+                    logger.info(f"PDF found in Zotero storage: {f}")
+                    return f
+
+    # === 4. Zotero API 云端下载 → 存到 data/papers/（不再存 parsed/）===
+    if pdf_keys:
+        pdf_key = pdf_keys[0]
+        papers_dir = config.PAPERS_DIR
+        papers_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            zot.dump(pdf_key, str(papers_dir))
+            for f in papers_dir.iterdir():
+                if f.suffix == ".pdf":
+                    logger.info(f"PDF downloaded from Zotero API: {f}")
+                    return f
+        except Exception as e:
+            logger.debug(f"API 下载失败: {e}")
+
+    logger.error(f"无法获取 PDF: {item_key}")
     return None
 
 
