@@ -279,7 +279,30 @@ def download_pdf(
     except Exception as e:
         logger.debug(f"API 下载也失败: {e}")
 
-    logger.error(f"无法获取 PDF: {item_key} (本地 {local_dir} 不存在，云端 404)")
+    # === Strategy 3: Check linked_file attachments ===
+    linked_path = _get_linked_file_path(zot, item_key)
+    if linked_path and Path(linked_path).exists():
+        # Copy linked file to parsed/ dir so it behaves like a normal attachment
+        shutil.copy2(linked_path, pdf_path)
+        logger.info(f"PDF 已从 linked_file 复制: {linked_path} → {pdf_path}")
+        return pdf_path
+
+    logger.error(f"无法获取 PDF: {item_key} (本地 {local_dir} 不存在，云端 404，linked_file 也没有)")
+    return None
+
+
+def _get_linked_file_path(zot: zotero.Zotero, item_key: str) -> str | None:
+    """检查论文的附件中是否有 linked_file 模式，返回其路径。"""
+    try:
+        children = zot.children(item_key)
+        for child in children:
+            data = child["data"]
+            if data.get("linkMode") == "linked_file" and data.get("contentType") == "application/pdf":
+                path = data.get("path", "")
+                if path:
+                    return path
+    except Exception as e:
+        logger.debug(f"linked_file 检查失败: {e}")
     return None
 
 

@@ -497,25 +497,55 @@ def import_to_zotero(
         logger.error(f"Zotero create error: {e}")
         return None
 
-    # Create linked attachment - PDF stays local, Zotero only stores path reference
+    # Create linked attachment - archive PDF to permanent storage first
     if pdf_path and pdf_path.exists():
         try:
+            # Archive: move PDF from temp downloads to permanent papers/ dir
+            archive_path = _archive_pdf(pdf_path, paper)
             linked_att = {
                 "itemType": "attachment",
                 "linkMode": "linked_file",
-                "path": str(pdf_path.resolve()),
+                "path": str(archive_path.resolve()),
                 "contentType": "application/pdf",
-                "title": pdf_path.name,
+                "title": archive_path.name,
             }
             att_resp = zot.create_items([linked_att], parentid=item_key)
             if att_resp.get("failed"):
                 logger.warning(f"Linked attachment failed: {att_resp['failed']}")
             else:
-                logger.info(f"Linked attachment created: {pdf_path.name}")
+                logger.info(f"Linked attachment created: {archive_path.name} (archived)")
         except Exception as e:
             logger.warning(f"Failed to create linked attachment: {e}")
 
     return item_key
+
+
+def _archive_pdf(pdf_path: Path, paper: dict) -> Path:
+    """
+    将 PDF 从临时下载目录归档到永久存储 (data/papers/)。
+    linked_file 指向永久路径，临时文件可以清理。
+    """
+    import shutil
+    archive_name = _safe_filename(paper)
+    archive_path = config.PAPERS_DIR / archive_name
+
+    if archive_path.exists():
+        # Already archived, just clean up the temp file
+        if pdf_path != archive_path and pdf_path.exists():
+            pdf_path.unlink(missing_ok=True)
+            logger.info(f"PDF already archived, cleaned temp: {pdf_path.name}")
+        return archive_path
+
+    # Move (not copy) from temp to permanent
+    if pdf_path.parent == config.PAPERS_DIR:
+        # Already in the right dir, just rename
+        if pdf_path.name != archive_name:
+            pdf_path.rename(archive_path)
+        return archive_path
+
+    shutil.move(str(pdf_path), str(archive_path))
+    logger.info(f"PDF archived: {pdf_path.name} → {archive_path}")
+    return archive_path
 
 
 # ============================================================================

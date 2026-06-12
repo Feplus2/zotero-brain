@@ -793,17 +793,34 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
             if not query:
                 return [TextContent(type="text", text="recommend 模式需要提供 query 参数")]
 
-            results = vector_store.search(
+            # Search more results to account for deduplication (multiple chunks per paper)
+            raw_results = vector_store.search(
                 query,
                 collection_names=collections,
-                n_results=n_results,
+                n_results=n_results * 3,
             )
 
-            if not results:
+            if not raw_results:
+                return [TextContent(type="text", text="未找到相关论文，无法推荐引用")]
+
+            # Deduplicate by paper key, keep highest score per paper
+            seen_keys = set()
+            deduped = []
+            for r in raw_results:
+                paper_key = r["metadata"].get("key", "")
+                if paper_key and paper_key in seen_keys:
+                    continue
+                if paper_key:
+                    seen_keys.add(paper_key)
+                deduped.append(r)
+                if len(deduped) >= n_results:
+                    break
+
+            if not deduped:
                 return [TextContent(type="text", text="未找到相关论文，无法推荐引用")]
 
             output = [f"## 语义引用推荐 (query: {query[:60]})\n"]
-            for i, r in enumerate(results, 1):
+            for i, r in enumerate(deduped, 1):
                 meta = r["metadata"]
                 output.append(f"### {i}. {meta.get('title', '?')} (相似度: {r['score']:.3f})")
                 output.append(f"- 作者: {meta.get('authors', '?')} | 年份: {meta.get('year', '?')}")

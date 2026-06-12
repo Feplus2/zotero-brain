@@ -43,8 +43,9 @@ PROJECT_DIR = Path(__file__).parent
 DATA_DIR = PROJECT_DIR / "data"
 CHROMA_DIR = DATA_DIR / "chroma_db"
 PARSED_DIR = PROJECT_DIR / "parsed"
+PAPERS_DIR = DATA_DIR / "papers"          # 永久 PDF 存储（linked_file 指向这里）
 ZOTERO_LOCAL_STORAGE = Path(os.path.expanduser(r"~\Zotero\storage"))
-for _d in [CHROMA_DIR, PARSED_DIR, DATA_DIR]:
+for _d in [CHROMA_DIR, PARSED_DIR, DATA_DIR, PAPERS_DIR]:
     _d.mkdir(parents=True, exist_ok=True)
 
 # -- ZHIPU Embedding-3 (official docs: docs.bigmodel.cn) --
