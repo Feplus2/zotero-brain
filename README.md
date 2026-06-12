@@ -11,26 +11,27 @@ Zotero Brain fixes that:
 ```
 Zotero  -->  MinerU Cloud API (PDF -> Markdown)  -->  Chunking  -->  ZhiPu Embedding  -->  ChromaDB
                                                                                               |
-                                                                                         MCP Server (10 tools)
+                                                                                         MCP Server (11 tools)
                                                                                               |
                                                                                     AI Agent (WorkBuddy / IDE)
 ```
 
 **Key features:**
 - Semantic search across your entire library ("find papers about solid electrolyte interface stability")
-- Multi-paper comparison (methods, results, experimental design)
 - Full-text Q&A (not just abstracts, not hallucinated)
-- BibTeX citation export
+- BibTeX citation export with semantic recommendation for writing assistance
 - Auto-discovery from OpenAlex / arXiv / CrossRef / Semantic Scholar
 - 6-level download cascade (OpenAlex OA -> Unpaywall -> CORE -> arXiv -> Sci-Hub -> manual)
 - Per-Collection vector stores (batteries stay separate from biology)
+- **Zotero-First design:** users see only Zotero folders, ChromaDB is internal
 
 ## Architecture
 
 - **No local GPU or models.** PDF parsing uses MinerU Cloud API (VLM, REST).
 - **No heavy SDK.** We call MinerU via raw `httpx` REST calls -- keeps deps lean.
 - **TUN mode compatible.** `network_helper.py` routes MinerU domestic traffic around TUN proxy via DoH + monkey-patching.
-- **MCP Server** over stdio, exposes 10 tools to any MCP-compatible AI agent.
+- **MCP Server** over stdio, exposes 11 tools to any MCP-compatible AI agent.
+- **No DeepSeek dependency.** Collection naming handled by Agent via `create_collection` tool.
 
 ## Installation
 
@@ -92,20 +93,38 @@ Add to your MCP client config (e.g. WorkBuddy `mcp.json`):
 }
 ```
 
-Then use the 10 tools from any AI agent:
+Then use the 11 tools from any AI agent:
 
+**搜索类**
 | Tool | What it does |
 |------|-------------|
-| `search_papers` | Semantic search in your library |
-| `compare_papers` | Compare multiple papers side-by-side |
-| `get_bibtex` | Generate BibTeX citations |
-| `list_collections` | List all Zotero Collections |
-| `ingest_paper` | Ingest a single paper (parse + embed) |
+| `search_papers` | Semantic search in your library (ChromaDB vector search) |
+| `discover_papers` | Search OpenAlex / arXiv / CrossRef / S2 for new papers |
+
+**下载 + 导入 + 入库（解耦三件套）**
+| Tool | What it does |
+|------|-------------|
+| `download_paper` | 6-level cascade PDF download (pure download, no Zotero/ChromaDB) |
+| `import_to_zotero` | Import PDF + metadata to Zotero (pure Zotero operation) |
+| `ingest_paper` | Parse PDF → chunk → embed → ChromaDB |
+
+**Collection 管理**
+| Tool | What it does |
+|------|-------------|
+| `list_collections` | Zotero folders + ChromaDB collections + sync status |
+| `create_collection` | Create Zotero folder + ChromaDB collection simultaneously |
+
+**引用**
+| Tool | What it does |
+|------|-------------|
+| `get_bibtex` | Dual mode: exact citation + semantic recommendation for writing |
+
+**深度阅读**
+| Tool | What it does |
+|------|-------------|
 | `get_paper_chunks` | Browse paper chunk structure |
 | `expand_context` | Expand context around a specific chunk |
 | `read_paper_full` | Read full paper text from cache |
-| `discover_papers` | Search OpenAlex / arXiv / CrossRef for new papers |
-| `fetch_and_ingest` | Download + import to Zotero + parse + embed (full pipeline) |
 
 ### Batch ingest (CLI)
 
@@ -136,14 +155,14 @@ python pdf_parser.py path/to/paper.pdf [item_key]
 
 ```
 zotero-brain/
-  mcp_server.py        # MCP Server (stdio, 10 tools)
+  mcp_server.py        # MCP Server (stdio, 11 tools, Phase 4)
   pdf_parser.py        # MinerU Cloud API (raw httpx)
   paper_discovery.py   # Academic DB search (OpenAlex, arXiv, CrossRef, S2)
   paper_importer.py    # 6-level download cascade + Zotero import
   chunker.py           # Markdown -> chunks
   embedder.py          # ZhiPu Embedding-3
   vector_store.py      # ChromaDB operations
-  zotero_sync.py       # Zotero Web API client
+  zotero_sync.py       # Zotero Web API client (folders, create, metadata)
   network_helper.py    # TUN bypass for MinerU (DoH + monkey-patch)
   run_ingest.py        # Batch ingest CLI
   config.py            # Config loader (.env)

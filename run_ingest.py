@@ -72,6 +72,20 @@ def _has_cached_parse(item_key: str, pdf_path: Path) -> bool:
     return cache_md.exists()
 
 
+def _ensure_collection_mapping(col_name: str) -> None:
+    """确保 Collection 有中英文映射，没有则自动生成 slug 并注册"""
+    if col_name == config.DEFAULT_COLLECTION:
+        return
+    if col_name in config._NAME_MAP:
+        return  # already mapped
+    # Auto-generate slug: use pinyin-style hash for Chinese names
+    import hashlib
+    h = hashlib.md5(col_name.encode()).hexdigest()[:10]
+    slug = f"col-{h}"
+    config.register_collection_mapping(col_name, slug)
+    logger.info(f"  自动注册映射: '{col_name}' → '{slug}'")
+
+
 def _process_paper(item: dict, markdown_text: str) -> int:
     """切块 + Embedding + 入库，返回 chunk 数量"""
     key = item["key"]
@@ -91,6 +105,10 @@ def _process_paper(item: dict, markdown_text: str) -> int:
         return 0
 
     target_collections = item.get("collection_names", [config.DEFAULT_COLLECTION])
+    # Ensure all target collections have mappings
+    for col_name in target_collections:
+        _ensure_collection_mapping(col_name)
+
     total = 0
     for col_name in target_collections:
         n = vector_store.add_chunks(chunks, collection_name=col_name)

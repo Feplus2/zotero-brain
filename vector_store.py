@@ -273,3 +273,44 @@ def get_full_text(paper_key: str) -> str | None:
             return md_files[0].read_text("utf-8")
 
     return None
+
+
+def create_collection(
+    collection_name: str,
+    chroma_name: str,
+    zotero_folder_key: str = "",
+) -> str:
+    """
+    创建 ChromaDB Collection，同时注册中英文映射 + 写入 Zotero 关联 metadata。
+
+    Args:
+        collection_name: 中文名（如 "钠电层状氧化物正极"）
+        chroma_name: ChromaDB 安全名（如 "sodium-layered-oxide-cathode"）
+        zotero_folder_key: 对应 Zotero Collection key（可选）
+
+    Returns: ChromaDB collection name
+    """
+    # 注册映射（会校验 chroma_name 合法性）
+    config.register_collection_mapping(collection_name, chroma_name)
+
+    client = _client()
+    metadata = {
+        "hnsw:space": "cosine",
+        "display_name": collection_name,
+    }
+    if zotero_folder_key:
+        metadata["zotero_folder_key"] = zotero_folder_key
+
+    col = client.get_or_create_collection(name=chroma_name, metadata=metadata)
+    logger.info(f"ChromaDB Collection 已创建: {chroma_name} (display={collection_name})")
+    return col.name
+
+
+def get_collection_metadata(chroma_name: str) -> dict | None:
+    """获取 Collection 的 metadata（display_name, zotero_folder_key 等）"""
+    client = _client()
+    try:
+        col = client.get_collection(chroma_name)
+        return col.metadata
+    except Exception:
+        return None
