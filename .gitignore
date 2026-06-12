@@ -5,3 +5,4 @@ __pycache__/
 data/
 parsed/
 *.egg-info/
+PROJECT.md
