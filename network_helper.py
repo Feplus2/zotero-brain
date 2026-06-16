@@ -57,7 +57,7 @@ _mineru_ips: dict[str, list[str]] = {}
 
 # Patch state
 _installed = False
-_orig_send_single_request = None
+_original_client_init = None
 
 # Direct transport (bypasses proxy, connects to real IP)
 _direct_transport: httpx.HTTPTransport | None = None
@@ -84,6 +84,45 @@ def _get_direct_transport() -> httpx.HTTPTransport:
             retries=2,
         )
     return _direct_transport
+
+
+class _MineruRoutingTransport:
+    """Routes MinerU requests to direct IP transport, all others to proxy transport.
+
+    Uses httpx's stable transport interface (handle_request / close) instead of
+    monkey-patching internal methods like _send_single_request.
+    """
+
+    def __init__(self, proxy_transport):
+        self._proxy = proxy_transport
+        self._direct = _get_direct_transport()
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        rewritten = _rewrite_request(request)
+        if rewritten is not None:
+            logger.info(
+                '[route] %s -> %s | %s',
+                request.url.host, rewritten.url.host, request.url.path[:80]
+            )
+            return self._direct.handle_request(rewritten)
+        return self._proxy.handle_request(request)
+
+    def close(self):
+        self._direct.close()
+        self._proxy.close()
+
+    def __enter__(self):
+        if hasattr(self._proxy, '__enter__'):
+            self._proxy.__enter__()
+        if hasattr(self._direct, '__enter__'):
+            self._direct.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        if hasattr(self._proxy, '__exit__'):
+            self._proxy.__exit__(*args)
+        if hasattr(self._direct, '__exit__'):
+            self._direct.__exit__(*args)
 
 
 # -- DoH resolution --
@@ -203,80 +242,46 @@ def _rewrite_request(request: httpx.Request) -> httpx.Request | None:
     return new_request
 
 
-# -- Monkey patch --
+# -- Transport injection (stable httpx public API) --
 
-def _patched_send_single_request(self, request: httpx.Request) -> httpx.Response:
-    """
-    Replaces httpx.Client._send_single_request.
-
-    MinerU request -> direct transport (bypass proxy)
-    Other requests -> unchanged (through proxy transport)
-    """
-    orig_host = request.url.host
-    rewritten = _rewrite_request(request)
-    if rewritten is not None:
-        logger.info(f"[monkey-patch] {orig_host} -> {rewritten.url.host} | {request.url.path[:80]}")
-        # MinerU request: send via direct transport
-        transport = _get_direct_transport()
-        import time as _time
-        from httpx._client import BoundSyncStream
-        from httpx._transports.default import map_httpcore_exceptions
-        from httpx import SyncByteStream
-
-        start = _time.perf_counter()
-        with map_httpcore_exceptions():
-            response = transport.handle_request(rewritten)
-
-        assert isinstance(response.stream, SyncByteStream)
-        response.request = rewritten
-        response.stream = BoundSyncStream(
-            response.stream, response=response, start=start,
-        )
-        self.cookies.extract_cookies(response)
-        response.default_encoding = self._default_encoding
-
-        logger.info(
-            'HTTP Request: %s %s "%s %d %s"',
-            rewritten.method,
-            rewritten.url,
-            response.http_version,
-            response.status_code,
-            response.reason_phrase,
-        )
-        return response
-
-    # Non-MinerU: use original flow (may go through proxy)
-    return _orig_send_single_request(self, request)
+_original_client_init = None
 
 
 def install():
-    """Install monkey patch. Does not clear proxy env vars.
+    """Inject MinerU routing transport at httpx.Client constructor level.
 
-    DoH resolution is deferred until first real MinerU IP is needed (via get_ips_for_domain),
-    avoiding startup delay during MCP Server handshake.
+    Uses httpx's stable transport interface (handle_request/close) instead of
+    monkey-patching _send_single_request or other internal methods.
+
+    DoH resolution is deferred until first real MinerU IP is needed.
     """
-    global _installed, _orig_send_single_request
+    global _installed, _original_client_init
 
     if _installed:
         return
 
-    _orig_send_single_request = httpx.Client._send_single_request
-    httpx.Client._send_single_request = _patched_send_single_request
+    _original_client_init = httpx.Client.__init__
+
+    def _patched_init(self, *args, **kwargs):
+        _original_client_init(self, *args, **kwargs)
+        self._transport = _MineruRoutingTransport(self._transport)
+
+    httpx.Client.__init__ = _patched_init
     _installed = True
 
-    logger.info("MinerU direct-connect patch installed (DoH lazy-loaded on first request)")
+    logger.info("MinerU direct-connect patch installed (transport-level, DoH lazy-loaded)")
 
 
 def uninstall():
     """Uninstall patch."""
-    global _installed, _orig_send_single_request, _direct_transport
+    global _installed, _original_client_init, _direct_transport
 
     if not _installed:
         return
 
-    if _orig_send_single_request is not None:
-        httpx.Client._send_single_request = _orig_send_single_request
-        _orig_send_single_request = None
+    if _original_client_init is not None:
+        httpx.Client.__init__ = _original_client_init
+        _original_client_init = None
 
     if _direct_transport is not None:
         _direct_transport.close()
