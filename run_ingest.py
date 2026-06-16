@@ -75,22 +75,8 @@ def _has_cached_parse(item_key: str, pdf_path: Path) -> bool:
     return False
 
 
-def _ensure_collection_mapping(col_name: str) -> None:
-    """确保 Collection 有中英文映射，没有则自动生成 slug 并注册"""
-    if col_name == config.DEFAULT_COLLECTION:
-        return
-    if col_name in config._NAME_MAP:
-        return  # already mapped
-    # Auto-generate slug: use pinyin-style hash for Chinese names
-    import hashlib
-    h = hashlib.md5(col_name.encode()).hexdigest()[:10]
-    slug = f"col-{h}"
-    config.register_collection_mapping(col_name, slug)
-    logger.info(f"  自动注册映射: '{col_name}' → '{slug}'")
-
-
-def _process_paper(item: dict, markdown_text: str) -> int:
-    """切块 + Embedding + 入库，返回 chunk 数量"""
+def _process_paper(item: dict, markdown_text: str) -> dict:
+    """切块 + Embedding + 入库，返回 structured result dict"""
     key = item["key"]
     title = item.get("title", "?")
     paper_metadata = {
@@ -101,23 +87,27 @@ def _process_paper(item: dict, markdown_text: str) -> int:
         "doi": item.get("doi", ""),
         "url": item.get("url", ""),
         "abstract": item.get("abstract", ""),
+        "journal": item.get("journal", ""),
+        "volume": item.get("volume", ""),
+        "issue": item.get("issue", ""),
+        "pages": item.get("pages", ""),
     }
     chunks = chunker.chunk_markdown(markdown_text, paper_metadata=paper_metadata)
     if not chunks:
         logger.warning(f"  {key}: no chunks")
-        return 0
+        return {"added": 0, "skipped": 0, "skipped_details": []}
 
     target_collections = item.get("collection_names", [config.DEFAULT_COLLECTION])
-    # Ensure all target collections have mappings
+    total_result = {"added": 0, "skipped": 0, "skipped_details": []}
     for col_name in target_collections:
-        _ensure_collection_mapping(col_name)
-
-    total = 0
-    for col_name in target_collections:
-        n = vector_store.add_chunks(chunks, collection_name=col_name)
-        total += n
-        logger.info(f"  {key}: {n} chunks -> [{col_name}]")
-    return total
+        config.ensure_collection_mapping(col_name)
+        result = vector_store.add_chunks(chunks, collection_name=col_name)
+        total_result["added"] += result["added"]
+        total_result["skipped"] += result["skipped"]
+        for sd in result["skipped_details"]:
+            total_result["skipped_details"].append({**sd, "collection": col_name})
+        logger.info(f"  {key}: {result['added']} chunks -> [{col_name}]")
+    return total_result
 
 
 def _submit_and_wait_batch(
@@ -177,8 +167,7 @@ def _submit_and_wait_batch(
                 if md_text:
                     cache_dir = config.PARSED_DIR / item_key
                     cache_dir.mkdir(parents=True, exist_ok=True)
-                    pdf_stem = pdf_paths[i].stem
-                    cache_md = cache_dir / f"{pdf_stem}.md"
+                    cache_md = cache_dir / f"{item_key}.md"
                     cache_md.write_text(md_text, encoding="utf-8")
 
                     if images:
@@ -254,6 +243,20 @@ def run(
         print("\n  没有需要处理的论文")
         return
 
+    # Pre-check: warn about auto-generated collection slugs
+    _auto_cols = set()
+    for it in items:
+        for cn in it.get("collection_names", []):
+            if cn != config.DEFAULT_COLLECTION and config._has_auto_slug(cn):
+                _auto_cols.add(cn)
+    if _auto_cols:
+        print(f"\n  ⚠️  以下 {len(_auto_cols)} 个 Collection 使用了自动生成的 slug（col-xxx），语义搜索效果有限：")
+        for ac in sorted(_auto_cols):
+            _old = config.translate_collection_name(ac)
+            print(f"      {ac} → {_old}")
+        print("  建议通过 create_collection 工具设置规范英文名（支持自动迁移旧数据）。")
+        print("  按 Ctrl+C 中断，或继续使用自动生成的名称...")
+
     print()
 
     # -- Phase 1: Download PDF + Check cache --
@@ -276,7 +279,7 @@ def run(
 
         # Check cache
         if not force_parse and _has_cached_parse(key, pdf_path):
-            cache_md = config.PARSED_DIR / key / f"{pdf_path.stem}.md"
+            cache_md = config.PARSED_DIR / key / f"{key}.md"
             md = cache_md.read_text(encoding="utf-8")
             if md.strip():
                 cached[key] = (item, md)
@@ -358,6 +361,7 @@ def run(
         "skipped": 0,
         "failed": 0,
         "chunks": 0,
+        "skipped_chunks": 0,
     }
 
     for i, (key, (item, markdown_text)) in enumerate(all_papers.items(), 1):
@@ -367,12 +371,13 @@ def run(
         print(f"  Collection: {cols}")
 
         try:
-            n = _process_paper(item, markdown_text)
-            if n > 0:
+            result = _process_paper(item, markdown_text)
+            if result["added"] > 0:
                 stats["success"] += 1
-                stats["chunks"] += n
+                stats["chunks"] += result["added"]
             else:
                 stats["skipped"] += 1
+            stats["skipped_chunks"] += result["skipped"]
         except Exception as e:
             logger.error(f"    FAILED: {e}", exc_info=True)
             stats["failed"] += 1
@@ -391,6 +396,8 @@ def run(
     print(f"  跳过:       {stats['skipped']} 篇")
     print(f"  失败:       {stats['failed']} 篇")
     print(f"  新增块:     {stats['chunks']} 个")
+    if stats["skipped_chunks"] > 0:
+        print(f"  跳过块:     {stats['skipped_chunks']} 个（嵌入失败）")
     print("=" * 60)
 
     # ChromaDB status
