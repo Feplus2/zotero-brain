@@ -38,7 +38,7 @@ def _embed_one(text: str) -> list[float]:
         raise RuntimeError(f"Embedding failed: {data}")
     return data["data"][0]["embedding"]
 
-def embed_batch(texts: list[str]) -> list[list[float]]:
+def embed_batch(texts: list[str]) -> list[list[float] | None]:
     """批量向量化（每批最多 64 条，截断到 6000 chars）"""
     results = []
     for start in range(0, len(texts), config.ZHIPU_MAX_BATCH):
@@ -63,8 +63,8 @@ def embed_batch(texts: list[str]) -> list[list[float]]:
                     try:
                         results.append(_embed_one(t))
                     except Exception:
-                        logger.warning(f"  跳过 1 条 (embedding 失败)")
-                        results.append([0.0] * config.ZHIPU_DIM)
+                        logger.warning(f"  跳过 1 条 (embedding 失败): {t[:120]}")
+                        results.append(None)
                     time.sleep(0.1)
                 continue
             raise
