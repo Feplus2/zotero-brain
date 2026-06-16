@@ -197,11 +197,11 @@ MinerU 解析时从 PDF 中提取所有图片，保存在 `parsed/{KEY}/images/`
 4. ingest_paper(pdf_path="/path/to/paper.pdf", collection="目标文件夹")
 ```
 
-### 场景 B2：从 Zotero 文件夹批量入库
+### 场景 B2：从指定 Zotero 文件夹批量入库
 
 ```
 1. list_collections() → 确认目标文件夹存在且有 PDF
-2. ingest_paper(batch_collection="固态电解质", collection="固态电解质")
+2. ingest_paper(batch_collection="目标文件夹", collection="目标文件夹")
    → 自动跳过已入库论文，只处理新增
    → 输出汇总：总计 N 篇 / 成功 M / 跳过 K / 无PDF P
 ```
