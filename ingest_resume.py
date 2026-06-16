@@ -82,6 +82,10 @@ def main():
             "doi": item.get("doi", ""),
             "url": item.get("url", ""),
             "abstract": item.get("abstract", ""),
+            "journal": item.get("journal", ""),
+            "volume": item.get("volume", ""),
+            "issue": item.get("issue", ""),
+            "pages": item.get("pages", ""),
         }
         chunks = chunker.chunk_markdown(markdown_text, paper_metadata=paper_metadata)
         if not chunks:
@@ -90,8 +94,8 @@ def main():
 
         target_collections = item.get("collection_names", [config.DEFAULT_COLLECTION])
         for col_name in target_collections:
-            n = vector_store.add_chunks(chunks, collection_name=col_name)
-            total_chunks += n
+            result = vector_store.add_chunks(chunks, collection_name=col_name)
+            total_chunks += result["added"]
 
     logger.info(f"补全完毕！共处理 {len(missing)} 篇，{total_chunks} chunks")
     # Print final statistics
