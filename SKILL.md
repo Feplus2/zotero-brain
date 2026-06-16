@@ -37,12 +37,13 @@ PROJECT_DIR/                       # 项目根目录
 ├── vector_store.py                # ChromaDB 向量存储
 ├── network_helper.py              # TUN 绕过（MinerU 国内直连）
 ├── run_ingest.py                  # 批量入库脚本
+├── ingest_resume.py               # 增量补全入库（已解析未入库的论文入 ChromaDB）
 │
 ├── parsed/                        # ★ MinerU 解析缓存（核心！）
-│   └── {KEY}/                     #   以 Zotero item key 命名
-│       ├── {KEY}.md               #   结构化 Markdown 全文
-│       ├── images/                #   从 PDF 提取的图片（hash 命名）
-│       └── {KEY}.pdf              #   偶有一份 PDF 副本
+│   └── {KEY}/                     # 以 Zotero item key 命名
+│       ├── {KEY}.md               # 结构化 Markdown 全文
+│       ├── images/                # 从 PDF 提取的图片（hash 命名）
+│       └── {KEY}.pdf              # 偶有一份 PDF 副本
 │
 ├── data/
 │   ├── chroma_db/                 # ChromaDB 向量数据库
@@ -51,7 +52,7 @@ PROJECT_DIR/                       # 项目根目录
 │   └── collection_map.json        # 中文名 → ChromaDB slug 映射
 │
 └── ZOTERO_LOCAL_STORAGE/          # Zotero 本地 storage（备用位置）
-    └── {KEY}/                     #   部分旧论文的 PDF 可能在这里
+    └── {KEY}/                     # 部分旧论文的 PDF 可能在这里
 ```
 
 ### 关键路径速查
@@ -179,7 +180,9 @@ MinerU 解析时从 PDF 中提取所有图片，保存在 `parsed/{KEY}/images/`
 1. list_collections() → 看用户有哪些 Zotero 文件夹 + 同步状态
 2. discover_papers(query="...") → 搜论文，返回候选列表
 3. Agent 判断论文属于哪个文件夹
-   → 匹配上了 → download → import_to_zotero → ingest_paper 三步走
+   → 匹配上了 → 从候选列表中提取 DOI，用 download_paper(doi="...")
+             → 将返回的 metadata 传给 import_to_zotero(title=..., doi=..., pdf_path=...)
+             → ingest_paper(zotero_key=...)
    → 没匹配上 → 问用户："这篇放哪个文件夹？还是新建一个？"
    → 用户想新建 → create_collection(folder_name="新名字", chroma_name="english-slug")
 4. search_papers(query="论文标题") → 验证入库成功
@@ -193,6 +196,17 @@ MinerU 解析时从 PDF 中提取所有图片，保存在 `parsed/{KEY}/images/`
 3. import_to_zotero(title="...", pdf_path="/path/to/paper.pdf", collection="目标文件夹")
 4. ingest_paper(pdf_path="/path/to/paper.pdf", collection="目标文件夹")
 ```
+
+### 场景 B2：从 Zotero 文件夹批量入库
+
+```
+1. list_collections() → 确认目标文件夹存在且有 PDF
+2. ingest_paper(batch_collection="固态电解质", collection="固态电解质")
+   → 自动跳过已入库论文，只处理新增
+   → 输出汇总：总计 N 篇 / 成功 M / 跳过 K / 无PDF P
+```
+
+> **注意：** `batch_collection` 和 `collection` 参数应保持一致，否则第二次调用时跳过检查可能失效导致重复解析。建议同时传两个参数且填相同值。
 
 ### 场景 C：完整下载 + 导入 + 入库
 
@@ -289,3 +303,6 @@ ChromaDB 只接受 `[a-z0-9._-]`（3-512 字符，首尾必须 a-z0-9）。
 2. **get_bibtex 双模式** — `mode="exact"` 用于已知论文的精确引用，`mode="recommend"` 用于写作时的语义推荐
 3. **Collection 映射** — 中英文映射由 `create_collection` 工具写入 `collection_map.json`
 4. **网络要求** — MinerU（国内）必须直连不走代理；OpenAlex/Unpaywall/CrossRef/Zotero（境外）需要代理。`network_helper.py` 会自动处理 MinerU 的直连绕过
+5. **download_paper 优先用 DOI** — `discover_papers` 返回的每条候选都有 DOI。调用 `download_paper` 时一律用 `doi` 参数定位论文，禁止仅用 `title` 搜索后盲取首个结果。`title` 参数仅作为元数据标签辅助使用。
+6. **read_paper_full 只在用户明确要求时使用** — 平时优先使用 `get_paper_chunks` + `expand_context` 定位需要的段落，但在用户指定读全文时必须读完论文全部内容。
+7. **PDF 可能货不对板** — 即使 DOI 正确，部分数据源（如 CORE、Sci-Hub）偶尔返回错误论文的 PDF。`download_paper` 已内置元数据标题校验，不匹配时会自动丢弃并尝试下一个源。如果所有源均因校验失败或下载失败而耗尽，告知用户并建议手动下载。导入和入库前请再次确认 PDF 内容与预期论文一致。
