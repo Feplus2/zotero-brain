@@ -40,7 +40,10 @@ import network_helper
 logger = logging.getLogger(__name__)
 
 # Install MinerU TUN direct-connect patch (bypass TUN for MinerU domestic traffic)
-network_helper.install()
+try:
+    network_helper.install()
+except Exception as e:
+    logger.warning(f"Network helper install failed (MinerU direct-connect may not work): {e}")
 
 # MCP Server instance
 server = Server("zotero-brain")
@@ -55,19 +58,28 @@ def _ingest_paper(
     force_parse: bool = False,
     pdf_path: str | None = None,
     collection: str | None = None,
-) -> int:
-    """Ingest a single paper, return chunk count.
+) -> dict:
+    """Ingest a single paper, return structured result dict.
 
     Args:
         item: paper metadata dict (must have "key", "title", etc.)
         force_parse: force re-parse PDF
         pdf_path: known PDF path (skip Zotero download)
         collection: target collection name (overrides item's collection_names)
+
+    Returns: {"added": int, "skipped": int, "skipped_details": [...]}
     """
     from pathlib import Path as _Path
     key = item["key"]
     title = item.get("title", "?")
     logger.info(f"[ingest] {key}: {title[:60]}")
+
+    # 0. Skip if already ingested in ChromaDB (avoid wasteful re-embedding)
+    if not force_parse:
+        existing_chunks = vector_store.get_chunks_by_key(key, collection_name=collection)
+        if existing_chunks:
+            logger.info(f"  already in ChromaDB ({len(existing_chunks)} chunks), skipping")
+            return {"added": 0, "skipped": 0, "skipped_details": []}
 
     # 1. Get PDF
     if pdf_path:
@@ -77,18 +89,22 @@ def _ingest_paper(
         pdf_path = zotero_sync.download_pdf(item_key=key)
     if pdf_path is None:
         logger.warning(f"  skip: no PDF")
-        return 0
+        return {"added": 0, "skipped": 0, "skipped_details": []}
 
-    # 1.5 Auto-archive PDF to permanent storage
-    pdf_path = paper_importer._archive_pdf(pdf_path, item)
-    # Update Zotero linked_file if the PDF was moved
-    zotero_sync.update_linked_file_path(key, str(pdf_path.resolve()))
+    # 1.5 Auto-archive PDF to permanent storage (safe mode: don't rename linked files)
+    _original_pdf_path = pdf_path
+    pdf_path = paper_importer._archive_pdf(pdf_path, item, allow_rename=False)
+    # Update Zotero linked_file only if no attachment exists yet (avoid redundant API calls)
+    if pdf_path != _original_pdf_path:
+        existing = zotero_sync._get_linked_file_path(None, key)
+        if not existing:
+            zotero_sync.update_linked_file_path(key, str(pdf_path.resolve()))
 
     # 2. MinerU parse
     markdown_text = pdf_parser.parse_pdf(pdf_path, item_key=key, force=force_parse)
     if not markdown_text.strip():
         logger.warning(f"  skip: empty parse result")
-        return 0
+        return {"added": 0, "skipped": 0, "skipped_details": []}
 
     # 3. Chunk
     paper_metadata = {
@@ -99,26 +115,37 @@ def _ingest_paper(
         "doi": item.get("doi", ""),
         "url": item.get("url", ""),
         "abstract": item.get("abstract", ""),
+        "journal": item.get("journal", ""),
+        "volume": item.get("volume", ""),
+        "issue": item.get("issue", ""),
+        "pages": item.get("pages", ""),
     }
     chunks = chunker.chunk_markdown(markdown_text, paper_metadata=paper_metadata)
     if not chunks:
-        return 0
+        return {"added": 0, "skipped": 0, "skipped_details": []}
 
     # 4. Store in ChromaDB
     if collection:
         target_collections = [collection]
     else:
         target_collections = item.get("collection_names", [config.DEFAULT_COLLECTION])
-    total = 0
+    total_result = {"added": 0, "skipped": 0, "skipped_details": []}
     for col_name in target_collections:
-        total += vector_store.add_chunks(chunks, collection_name=col_name)
+        config.ensure_collection_mapping(col_name)
+        result = vector_store.add_chunks(chunks, collection_name=col_name)
+        total_result["added"] += result["added"]
+        total_result["skipped"] += result["skipped"]
+        for sd in result["skipped_details"]:
+            total_result["skipped_details"].append({**sd, "collection": col_name})
 
-    return total
+    return total_result
 
 
 def _generate_bibtex(meta: dict) -> str:
     """Generate BibTeX from metadata dict (supports full fields from Zotero)."""
     authors = meta.get("authors", [])
+    if isinstance(authors, str):
+        authors = [a.strip() for a in authors.split(",") if a.strip()]
     if isinstance(authors, list):
         author_str = " and ".join(authors) if authors else "Unknown"
     else:
@@ -129,24 +156,103 @@ def _generate_bibtex(meta: dict) -> str:
     cite_key = f"{first_author}_{year}".lower().replace(" ", "_")
 
     lines = [f"@article{{{cite_key},"]
-    lines.append(f"  title={{{{{meta.get('title', 'Unknown')}}}}},")
-    lines.append(f"  author={{{{{author_str}}}}},")
-    lines.append(f"  year={{{{{year}}}}},")
+    lines.append(f"  title={{{meta.get('title', 'Unknown')}}},")
+    lines.append(f"  author={{{author_str}}},")
+    lines.append(f"  year={{{year}}},")
     if meta.get("doi"):
-        lines.append(f"  doi={{{{{meta['doi']}}}}},")
+        lines.append(f"  doi={{{meta['doi']}}},")
     if meta.get("journal"):
-        lines.append(f"  journal={{{{{meta['journal']}}}}},")
+        lines.append(f"  journal={{{meta['journal']}}},")
     if meta.get("volume"):
-        lines.append(f"  volume={{{{{meta['volume']}}}}},")
+        lines.append(f"  volume={{{meta['volume']}}},")
     if meta.get("pages"):
-        lines.append(f"  pages={{{{{meta['pages']}}}}},")
+        lines.append(f"  pages={{{meta['pages']}}},")
     if meta.get("issue"):
-        lines.append(f"  number={{{{{meta['issue']}}}}},")
+        lines.append(f"  number={{{meta['issue']}}},")
     if meta.get("url"):
-        lines.append(f"  url={{{{{meta['url']}}}}},")
+        lines.append(f"  url={{{meta['url']}}},")
     lines.append("}")
 
     return "\n".join(lines)
+
+
+# ============================================================================
+# Parameter validation
+# ============================================================================
+
+_VALIDATE_MAX_RESULTS = 100
+_VALIDATE_MAX_CONTEXT = 20
+
+
+def _validate_tool_args(name: str, args: dict) -> str | None:
+    """Validate tool arguments. Returns error message string, or None if valid.
+
+    Strategy: numeric params are clamped (not rejected) to safe bounds;
+    type errors on critical params return an error message.
+    """
+    # --- truncation bounds (clamp, don't reject) ---
+    if "n_results" in args:
+        n = args["n_results"]
+        if isinstance(n, (int, float)):
+            args["n_results"] = min(max(int(n), 1), _VALIDATE_MAX_RESULTS)
+        else:
+            args["n_results"] = 5
+
+    if "limit" in args:
+        li = args["limit"]
+        if isinstance(li, (int, float)):
+            args["limit"] = min(max(int(li), 1), _VALIDATE_MAX_RESULTS)
+        else:
+            args["limit"] = 10
+
+    if "prev" in args:
+        args["prev"] = max(min(int(args.get("prev", 2)), _VALIDATE_MAX_CONTEXT), 0)
+
+    if "next" in args:
+        args["next"] = max(min(int(args.get("next", 2)), _VALIDATE_MAX_CONTEXT), 0)
+
+    # --- type coercion ---
+    if "chunk_index" in args:
+        ci = args["chunk_index"]
+        if isinstance(ci, str) and ci.lstrip("-").isdigit():
+            args["chunk_index"] = int(ci)
+        if not isinstance(args["chunk_index"], int):
+            return "chunk_index 必须是整数"
+
+    # --- non-empty checks ---
+    if "query" in args:
+        q = (args.get("query") or "").strip()
+        if not q:
+            return "query 不能为空"
+        args["query"] = q[:500]
+
+    if "title" in args:
+        t = (args.get("title") or "").strip()
+        if not t:
+            return "title 为必填参数"
+        args["title"] = t
+
+    if "folder_name" in args:
+        fn = (args.get("folder_name") or "").strip()
+        if not fn:
+            return "folder_name 不能为空"
+        args["folder_name"] = fn
+
+    # --- ingest: verify file exists ---
+    if name == "ingest_paper":
+        pdf_path_str = args.get("pdf_path")
+        zotero_key = args.get("zotero_key")
+        batch_col = (args.get("batch_collection") or "").strip()
+        if batch_col:
+            return None  # batch_collection mode: skip individual checks
+        if not zotero_key and not pdf_path_str:
+            return "需要提供 zotero_key、pdf_path 或 batch_collection"
+        if pdf_path_str:
+            from pathlib import Path
+            if not Path(pdf_path_str).exists():
+                return f"PDF 文件不存在: {pdf_path_str}"
+
+    return None
 
 
 # ============================================================================
@@ -264,6 +370,22 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "论文 URL（可选）",
                     },
+                    "journal": {
+                        "type": "string",
+                        "description": "期刊名（可选）",
+                    },
+                    "volume": {
+                        "type": "string",
+                        "description": "卷号（可选）",
+                    },
+                    "issue": {
+                        "type": "string",
+                        "description": "期号（可选）",
+                    },
+                    "pages": {
+                        "type": "string",
+                        "description": "页码（可选）",
+                    },
                     "pdf_path": {
                         "type": "string",
                         "description": "本地 PDF 路径（可选，创建 linked_file 附件）",
@@ -278,21 +400,25 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="ingest_paper",
-            description="解析 PDF → chunk → embed → ChromaDB 向量化入库。接受 Zotero key 或本地 pdf_path。",
+            description="解析 PDF → chunk → embed → ChromaDB 向量化入库。接受 Zotero key、本地 pdf_path，或 batch_collection（按 Zotero 文件夹批量入库）。",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "zotero_key": {
                         "type": "string",
-                        "description": "Zotero 论文 key（从 Zotero 拉 PDF + metadata）",
+                        "description": "Zotero 论文 key（从 Zotero 拉 PDF + metadata）。与 pdf_path、batch_collection 三选一。",
                     },
                     "pdf_path": {
                         "type": "string",
-                        "description": "本地 PDF 路径（跳过 Zotero 下载，直接使用本地文件）",
+                        "description": "本地 PDF 路径（跳过 Zotero 下载，直接使用本地文件）。与 zotero_key、batch_collection 三选一。",
+                    },
+                    "batch_collection": {
+                        "type": "string",
+                        "description": "Zotero 文件夹中文名（如 '钠电层状氧化物正极'）。提供时忽略 zotero_key 和 pdf_path，批量入库该文件夹下所有未入库论文。适合小文件夹（≤30 篇）。大会话可能超时，大批量建议用 CLI 的 run_ingest.py。",
                     },
                     "collection": {
                         "type": "string",
-                        "description": "目标 Collection 中文名（可选，如 '钠电层状氧化物正极'）",
+                        "description": "目标 Collection 中文名（可选）。未提供时沿用各论文在 Zotero 中的已有分类。批量模式建议保持一致，避免论文被重复解析。",
                     },
                     "force": {
                         "type": "boolean",
@@ -305,7 +431,7 @@ async def list_tools() -> list[Tool]:
         # === Collection 管理 ===
         Tool(
             name="list_collections",
-            description="同时返回 Zotero 文件夹列表 + ChromaDB collection 列表 + 同步状态。Agent 可据此判断哪些文件夹已同步、哪些需要 create_collection。",
+	    description="同时返回 Zotero 文件夹列表 + ChromaDB collection 列表 + 同步状态。注意：Zotero 条目数包含子条目（笔记、附件等），非纯论文数。Agent 可据此判断哪些文件夹已同步、哪些需要 create_collection。",
             inputSchema={
                 "type": "object",
                 "properties": {},
@@ -449,6 +575,10 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
     """Internal tool dispatcher. All exceptions are caught by the caller."""
     import asyncio as _asyncio
 
+    err = _validate_tool_args(name, arguments)
+    if err:
+        return [TextContent(type="text", text=f"参数错误: {err}")]
+
     # ====================================================================
     # search_papers (unchanged)
     # ====================================================================
@@ -458,7 +588,8 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
         paper_keys = arguments.get("paper_keys")
         n_results = arguments.get("n_results", 5)
 
-        results = vector_store.search(
+        results = await _asyncio.to_thread(
+            vector_store.search,
             query,
             collection_names=collections,
             n_results=n_results,
@@ -535,6 +666,10 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
                 "open_access_pdf": None,
                 "source": "manual",
                 "url": f"https://doi.org/{doi}",
+                "journal": "",
+                "volume": "",
+                "issue": "",
+                "pages": "",
             }
             # Try to enrich metadata from CrossRef
             try:
@@ -563,6 +698,10 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
                     date_parts = pub.get("date-parts", [[None]])
                     if date_parts and date_parts[0]:
                         paper["year"] = date_parts[0][0]
+                    paper["journal"] = (data.get("container-title") or [""])[0] or ""
+                    paper["volume"] = data.get("volume", "") or ""
+                    paper["issue"] = data.get("issue", "") or ""
+                    paper["pages"] = data.get("page", "") or ""
             except Exception as e:
                 logger.warning(f"CrossRef metadata fetch failed: {e}")
         else:
@@ -599,6 +738,10 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
                 "year": paper.get("year"),
                 "abstract": paper.get("abstract", ""),
                 "url": paper.get("url", ""),
+                "journal": paper.get("journal", ""),
+                "volume": paper.get("volume", ""),
+                "issue": paper.get("issue", ""),
+                "pages": paper.get("pages", ""),
             },
         }
         return [TextContent(type="text", text=f"✅ PDF 下载成功\n\n```json\n{json.dumps(result, ensure_ascii=False, indent=2)}\n```")]
@@ -625,6 +768,10 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
             "year": year,
             "abstract": abstract,
             "url": url,
+            "journal": arguments.get("journal", ""),
+            "volume": arguments.get("volume", ""),
+            "issue": arguments.get("issue", ""),
+            "pages": arguments.get("pages", ""),
             "open_access_pdf": None,
             "source": "manual",
         }
@@ -654,51 +801,154 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
     elif name == "ingest_paper":
         zotero_key = arguments.get("zotero_key")
         pdf_path_str = arguments.get("pdf_path")
+        batch_collection = (arguments.get("batch_collection") or "").strip()
         collection = arguments.get("collection")
         force = arguments.get("force", False)
 
+        # === Batch collection mode ===
+        if batch_collection:
+            from pathlib import Path as _Path
+
+            def _batch_ingest():
+                zot = zotero_sync._get_client()
+                collections = zotero_sync.list_collections(zot)
+                coll_key = None
+                for c in collections:
+                    if c["name"] == batch_collection:
+                        coll_key = c["key"]
+                        break
+                if coll_key is None:
+                    return None, batch_collection
+
+                items = zotero_sync.list_items(zot, collection_key=coll_key, check_pdf=False)
+                if not items:
+                    return [], batch_collection
+
+                stats = {"total": len(items), "success": 0, "skipped": 0, "no_pdf": 0, "chunks": 0}
+                results = []
+                for item in items:
+                    key = item["key"]
+                    title = item.get("title", "?")[:60]
+                    result = _ingest_paper(item, force_parse=force, collection=collection)
+                    if result["added"] > 0:
+                        stats["success"] += 1
+                        stats["chunks"] += result["added"]
+                        results.append(f"  ✅ {key}: {title} ({result['added']} chunks)")
+                    elif result["skipped"] > 0:
+                        stats["skipped"] += 1
+                        results.append(f"  ⚠️  {key}: {title} (部分跳过)")
+                    else:
+                        # Check if already ingested vs no PDF
+                        existing = vector_store.get_chunks_by_key(key, collection_name=collection)
+                        if existing:
+                            stats["skipped"] += 1
+                            results.append(f"  ⏭️  {key}: {title} (已入库)")
+                        else:
+                            stats["no_pdf"] += 1
+                            results.append(f"  ⬜ {key}: {title} (无 PDF)")
+                return stats, results
+
+            batch_result = await _asyncio.to_thread(_batch_ingest)
+            if batch_result[0] is None:
+                return [TextContent(type="text", text=f"❌ 未找到 Zotero 文件夹: {batch_collection}")]
+            if batch_result[0] == []:
+                return [TextContent(type="text", text=f"Zotero 文件夹 '{batch_collection}' 中没有论文")]
+
+            stats, results = batch_result
+            col_info = f" → {collection}" if collection else ""
+            msg = (
+                f"## 批量入库: {batch_collection}{col_info}\n\n"
+                f"总计 {stats['total']} 篇 | ✅ 入库 {stats['success']} | ⏭️ 跳过 {stats['skipped']} "
+                f"| ⬜ 无PDF {stats['no_pdf']} | 📄 {stats['chunks']} chunks\n\n"
+            )
+            msg += "\n".join(results)
+            if stats["no_pdf"] > 0:
+                msg += "\n\n💡 无 PDF 的论文需手动下载 PDF 后单独调用 ingest_paper(zotero_key=...)。"
+            return [TextContent(type="text", text=msg)]
+
+        # === Single paper mode (zotero_key or pdf_path) ===
         if not zotero_key and not pdf_path_str:
-            return [TextContent(type="text", text="需要提供 zotero_key 或 pdf_path 参数")]
+            return [TextContent(type="text", text="需要提供 zotero_key、pdf_path 或 batch_collection 参数")]
+
+        cross_warning = ""
+        if zotero_key and pdf_path_str:
+            cross_warning = (
+                "⚠️ 同时提供了 zotero_key 和 pdf_path。"
+                "将跳过 Zotero 下载，直接使用本地 PDF。"
+                "请确保该 PDF 与此论文匹配。\n\n"
+            )
 
         def _do_ingest():
             if zotero_key:
-                # From Zotero: pull metadata + download PDF
-                _items = zotero_sync.list_items(check_pdf=False)
-                _target = None
-                for _item in _items:
-                    if _item["key"] == zotero_key:
-                        _target = _item
-                        break
+                _target = zotero_sync.get_item_by_key(zotero_key)
                 if _target is None:
-                    return None, 0
-                return _target, _ingest_paper(_target, force_parse=force, pdf_path=pdf_path_str, collection=collection)
+                    return None, {"added": 0, "skipped": 0, "skipped_details": []}, False
+                return _target, _ingest_paper(_target, force_parse=force, pdf_path=pdf_path_str, collection=collection), True
             else:
-                # From local PDF only: construct minimal item
+                # From local PDF only: extract metadata → auto-import to Zotero → ingest
                 from pathlib import Path as _Path
                 _pdf = _Path(pdf_path_str)
                 if not _pdf.exists():
-                    return None, 0
-                _target = {
-                    "key": _pdf.stem,  # Use filename stem as key
-                    "title": _pdf.stem,
-                    "authors": [],
-                    "year": None,
-                    "doi": "",
-                    "url": "",
-                    "abstract": "",
-                    "collection_names": [collection] if collection else [config.DEFAULT_COLLECTION],
-                }
-                return _target, _ingest_paper(_target, force_parse=force, pdf_path=pdf_path_str, collection=collection)
+                    return None, {"added": 0, "skipped": 0, "skipped_details": []}, False
 
-        target, added = await _asyncio.to_thread(_do_ingest)
+                meta = pdf_parser.extract_pdf_metadata(_pdf)
+                paper = {
+                    "title": meta["title"],
+                    "doi": "",
+                    "authors": meta["authors"],
+                    "year": meta["year"],
+                    "abstract": "",
+                    "url": "",
+                    "open_access_pdf": None,
+                    "source": "pdf_metadata",
+                }
+
+                zk = paper_importer.import_to_zotero(paper, _pdf, collection)
+                if zk:
+                    _target = {
+                        "key": zk,
+                        "title": meta["title"],
+                        "authors": meta["authors"],
+                        "year": meta["year"],
+                        "doi": "",
+                        "url": "",
+                        "abstract": "",
+                        "collection_names": [collection] if collection else [config.DEFAULT_COLLECTION],
+                    }
+                    _result = _ingest_paper(_target, force_parse=force, pdf_path=pdf_path_str, collection=collection)
+                    return _target, _result, True  # extra flag: zotero_imported
+                else:
+                    logger.warning(f"Zotero import failed for {_pdf.name}, refusing to create orphan entries")
+                    return None, None, False  # target=None, result=None = signal Zotero import failure
+
+        target, result, zotero_imported = await _asyncio.to_thread(_do_ingest)
 
         if target is None:
             if zotero_key:
                 return [TextContent(type="text", text=f"未找到论文 (key={zotero_key})")]
+            if result is None:
+                return [TextContent(type="text", text=(
+                    f"❌ Zotero 自动导入失败，论文未入库 ChromaDB。\n"
+                    f"PDF: {pdf_path_str}\n"
+                    f"请先调用 import_to_zotero 手动导入，再用 zotero_key 调用 ingest_paper。"
+                ))]
             return [TextContent(type="text", text=f"PDF 不存在: {pdf_path_str}")]
 
         col_info = f" → {collection}" if collection else ""
-        return [TextContent(type="text", text=f"✅ 入库完成: {target.get('title', '?')[:50]}\n添加 {added} 个文本块{col_info}")]
+
+        if zotero_key:
+            prefix = ""
+        elif zotero_imported:
+            prefix = f"✅ Zotero 导入: key={target['key']}, 提取标题: \"{target.get('title', '?')[:50]}\"\n"
+
+        msg = f"{cross_warning}{prefix}✅ 入库完成: {target.get('title', '?')[:50]}\n添加 {result['added']} 个文本块{col_info}"
+        if result["skipped"] > 0:
+            msg += f"\n\n⚠️ 跳过 {result['skipped']} 个文本块（嵌入失败）:\n"
+            for sd in result["skipped_details"]:
+                col_label = f" [{sd.get('collection', '')}]" if sd.get('collection') else ""
+                msg += f"  - [chunk {sd['chunk_index']}]{col_label} {sd['section'][:30]}: {sd['text_preview'][:60]}...\n"
+            msg += "\n可能原因: 文本触发了智谱 Embedding API 内容安全过滤。这些段落将不参与语义搜索。"
+        return [TextContent(type="text", text=msg)]
 
     # ====================================================================
     # list_collections (REDO: Zotero folders + ChromaDB + sync status)
@@ -713,7 +963,7 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
         zot_folders, chroma_cols = await _asyncio.to_thread(_fetch_all)
 
         # Build sync status map
-        name_map = config._NAME_MAP  # zh -> en mapping
+        name_map = config.get_name_map_snapshot()  # zh -> en mapping
 
         sync_status = {}
         for folder in zot_folders:
@@ -739,7 +989,7 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
         for f in zot_folders:
             s = sync_status[f["name"]]
             sync_icon = "✅" if s["synced"] else "⚠️ 未同步"
-            output.append(f"- **{f['name']}** (key={f['key']}, {f['item_count']}篇) {sync_icon}")
+            output.append(f"- **{f['name']}** (key={f['key']}, {f['item_count']}个条目) {sync_icon}")
 
         output.append(f"\n## ChromaDB Collections ({len(chroma_cols)})\n")
         for c in chroma_cols:
@@ -805,7 +1055,8 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
                 return [TextContent(type="text", text="recommend 模式需要提供 query 参数")]
 
             # Search more results to account for deduplication (multiple chunks per paper)
-            raw_results = vector_store.search(
+            raw_results = await _asyncio.to_thread(
+                vector_store.search,
                 query,
                 collection_names=collections,
                 n_results=n_results * 3,
@@ -858,7 +1109,7 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
                 ))]
 
             # Try 2: ChromaDB metadata
-            chroma_results = vector_store.search(identifier, n_results=1)
+            chroma_results = await _asyncio.to_thread(vector_store.search, identifier, n_results=1)
             if chroma_results:
                 meta = chroma_results[0]["metadata"]
                 bibtex = _generate_bibtex(meta)
@@ -980,17 +1231,30 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
 
 async def main():
     """Start MCP Server."""
-    async with stdio_server() as (read_stream, write_stream):
-        logger.info("Zotero Brain MCP Server starting (Phase 4: 11 tools)")
-        await server.run(
-            read_stream,
-            write_stream,
-            server.create_initialization_options(),
-        )
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            logger.info("Zotero Brain MCP Server starting (Phase 4: 11 tools)")
+            await server.run(
+                read_stream,
+                write_stream,
+                server.create_initialization_options(),
+            )
+    except Exception as e:
+        logger.critical(f"Server run failed: {type(e).__name__}: {e}", exc_info=True)
+        raise
+    finally:
+        paper_discovery.close_client()
 
 
 if __name__ == "__main__":
+    import sys
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
     import asyncio
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("MCP Server stopped by user")
+    except Exception as e:
+        logger.critical(f"MCP Server crashed: {type(e).__name__}: {e}", exc_info=True)
+        sys.exit(1)
