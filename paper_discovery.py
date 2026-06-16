@@ -55,6 +55,10 @@ class DiscoveredPaper:
     open_access_pdf: str | None
     source: str  # "openalex" | "semantic_scholar" | "arxiv" | "crossref"
     url: str
+    journal: str = ""
+    volume: str = ""
+    issue: str = ""
+    pages: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -86,6 +90,15 @@ def _get_client() -> httpx.Client:
             },
         )
     return _client
+
+
+def close_client():
+    """Explicitly close the shared HTTP client and release connections."""
+    global _client
+    if _client is not None:
+        _client.close()
+        _client = None
+        logger.debug("Discovery HTTP client closed")
 
 
 # ============================================================================
@@ -160,6 +173,24 @@ def _search_openalex(query: str, limit: int = 10) -> list[DiscoveredPaper]:
         # Work URL
         url = w.get("id", "")
 
+        # Journal metadata from primary_location
+        journal = ""
+        volume = ""
+        issue = ""
+        pages = ""
+        biblio = w.get("biblio") or {}
+        volume = biblio.get("volume", "") or ""
+        issue = biblio.get("issue", "") or ""
+        first_page = biblio.get("first_page", "") or ""
+        last_page = biblio.get("last_page", "") or ""
+        if first_page and last_page:
+            pages = f"{first_page}-{last_page}"
+        elif first_page:
+            pages = first_page
+        primary_loc = w.get("primary_location") or {}
+        source = primary_loc.get("source") or {}
+        journal = source.get("display_name", "") or ""
+
         papers.append(DiscoveredPaper(
             title=title,
             authors=authors,
@@ -170,6 +201,10 @@ def _search_openalex(query: str, limit: int = 10) -> list[DiscoveredPaper]:
             open_access_pdf=oa_url,
             source="openalex",
             url=url,
+            journal=journal,
+            volume=volume,
+            issue=issue,
+            pages=pages,
         ))
 
     return papers
@@ -180,7 +215,7 @@ def _search_openalex(query: str, limit: int = 10) -> list[DiscoveredPaper]:
 # ============================================================================
 
 _S2_BASE = "https://api.semanticscholar.org/graph/v1/paper/search"
-_S2_FIELDS = "title,year,citationCount,externalIds,openAccessPdf,authors,abstract,url"
+_S2_FIELDS = "title,year,citationCount,externalIds,openAccessPdf,authors,abstract,url,journal"
 
 def _search_semantic_scholar(query: str, limit: int = 10) -> list[DiscoveredPaper]:
     """Semantic Scholar search."""
@@ -213,6 +248,11 @@ def _search_semantic_scholar(query: str, limit: int = 10) -> list[DiscoveredPape
         oa_url = oa.get("url")
         authors = [a["name"] for a in (p.get("authors") or [])]
 
+        journal_info = p.get("journal") or {}
+        journal = journal_info.get("name", "") or ""
+        volume = journal_info.get("volume", "") or ""
+        s2_pages = journal_info.get("pages", "") or ""
+
         papers.append(DiscoveredPaper(
             title=p.get("title", ""),
             authors=authors,
@@ -223,6 +263,9 @@ def _search_semantic_scholar(query: str, limit: int = 10) -> list[DiscoveredPape
             open_access_pdf=oa_url,
             source="semantic_scholar",
             url=p.get("url", ""),
+            journal=journal,
+            volume=volume,
+            pages=s2_pages,
         ))
 
     return papers
@@ -331,7 +374,7 @@ def _search_crossref(query: str, limit: int = 10) -> list[DiscoveredPaper]:
         resp = client.get(_CROSSREF_BASE, params={
             "query": query,
             "rows": str(limit),
-            "select": "title,DOI,published,abstract,author,URL,link,is-referenced-by-count",
+            "select": "title,DOI,published,abstract,author,URL,link,is-referenced-by-count,container-title,volume,issue,page",
         }, headers={
             "User-Agent": f"ZoteroBrain/1.0 (mailto:{config.UNPAYWALL_EMAIL})",
         })
@@ -377,6 +420,10 @@ def _search_crossref(query: str, limit: int = 10) -> list[DiscoveredPaper]:
             open_access_pdf=pdf_url,
             source="crossref",
             url=item.get("URL", ""),
+            journal=(item.get("container-title") or [""])[0] or "",
+            volume=item.get("volume", "") or "",
+            issue=item.get("issue", "") or "",
+            pages=item.get("page", "") or "",
         ))
 
     return papers
