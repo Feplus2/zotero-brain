@@ -127,6 +127,21 @@ CORE_API_KEY=你的CORE API密钥
 ```
 工作目录设为 zotero-brain 项目路径。
 
+**OpenCode：** 在项目文件夹创建一个 `opencode.jsonc` 文件，填入：
+```
+{
+  "plugin": [],
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "zotero-brain": {
+      "type": "local",
+      "command": [".venv/Scripts/python.exe", "mcp_server.py"],
+      "enabled": true
+    }
+  }
+}
+```
+
 **Cursor / 其他 MCP 客户端：** 在 `mcp.json` 中添加：
 ```json
 {
