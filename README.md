@@ -246,7 +246,7 @@ ingest_paper()
 |---|---|
 | `download_paper` | 6 级瀑布下载 PDF，不碰 Zotero 不碰向量库 |
 | `import_to_zotero` | 导入 PDF + 元数据到 Zotero（linked_file 附件） |
-| `ingest_paper` | PDF → OCR → 切块 → 向量化入库 |
+| `ingest_paper` | PDF → OCR → 切块 → 向量化入库 （单篇/指定 Zotero 分类）|
 
 ### 文件夹管理
 | 工具 | 用途 |
