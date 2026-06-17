@@ -29,6 +29,11 @@ _SKIP_TYPES = {"attachment", "note", "annotation"}
 
 def _get_client() -> zotero.Zotero:
     """创建 Zotero 客户端"""
+    if not config.ZOTERO_API_KEY or not config.ZOTERO_USER_ID:
+        raise RuntimeError(
+            "Zotero credentials not configured. "
+            "Set ZOTERO_API_KEY and ZOTERO_USER_ID in .env."
+        )
     return zotero.Zotero(
         config.ZOTERO_USER_ID,
         config.ZOTERO_LIBRARY_TYPE,
@@ -58,26 +63,51 @@ def list_collections(zot: zotero.Zotero | None = None) -> list[dict]:
     return result
 
 
-def _fetch_all_items(zot: zotero.Zotero, collection_key: str | None = None) -> list:
+def _fetch_all_items(zot: zotero.Zotero, collection_key: str | None = None, max_items: int | None = None) -> list:
     """
     翻页拉取全部 items（pyzotero 单次最多 100 条）
 
     使用 Zotero API 的 start + limit 分页，直到拿完为止。
+    max_items 为可选上限（达到后提前返回），None 表示全量。
+    单页失败时指数退避重试（最多 3 次），耗尽后返回已有部分数据。
     """
     all_items = []
     start = 0
+    max_retries = 3
+    consecutive_failures = 0
 
     while True:
-        if collection_key:
-            batch = zot.collection_items(collection_key, limit=_PAGE_SIZE, start=start)
-        else:
-            batch = zot.items(limit=_PAGE_SIZE, start=start)
+        try:
+            if collection_key:
+                batch = zot.collection_items(collection_key, limit=_PAGE_SIZE, start=start)
+            else:
+                batch = zot.items(limit=_PAGE_SIZE, start=start)
+        except Exception as e:
+            consecutive_failures += 1
+            if consecutive_failures > max_retries:
+                logger.error(
+                    f"Zotero fetch failed at start={start} after {max_retries} retries: {e}. "
+                    f"Returning {len(all_items)} partial items."
+                )
+                break
+            wait = 2 ** consecutive_failures
+            logger.warning(
+                f"Zotero fetch page error (start={start}), "
+                f"retry {consecutive_failures}/{max_retries} in {wait}s: {e}"
+            )
+            time.sleep(wait)
+            continue
+
+        consecutive_failures = 0
 
         if not batch:
             break
 
         all_items.extend(batch)
         logger.info(f"  已拉取 {len(all_items)} 条 (本批 {len(batch)})")
+
+        if max_items and len(all_items) >= max_items:
+            return all_items[:max_items]
 
         if len(batch) < _PAGE_SIZE:
             break  # 最后一页
@@ -107,10 +137,68 @@ def _item_has_pdf(zot: zotero.Zotero, item_key: str) -> bool:
     return False
 
 
+def _extract_item(result: dict, col_map: dict[str, str], zot=None, check_pdf: bool = False) -> dict | None:
+    """Extract unified metadata dict from a single Zotero item.
+
+    Returns None for non-paper types (attachment, note, annotation).
+    """
+    data = result["data"]
+
+    if data["itemType"] in _SKIP_TYPES:
+        return None
+
+    authors = []
+    for creator in data.get("creators", []):
+        if creator.get("creatorType") == "author":
+            last = creator.get("lastName", "")
+            first = creator.get("firstName", "")
+            name = f"{last} {first}".strip()
+            if name:
+                authors.append(name)
+
+    date_str = data.get("date", "")
+    year = None
+    if date_str:
+        try:
+            year = int(date_str[:4])
+        except (ValueError, IndexError):
+            pass
+
+    collection_names = []
+    for col_key in data.get("collections", []):
+        col_name = col_map.get(col_key, "")
+        if col_name:
+            collection_names.append(col_name)
+    if not collection_names:
+        collection_names = [config.DEFAULT_COLLECTION]
+
+    has_pdf = False
+    if check_pdf and zot is not None:
+        has_pdf = _item_has_pdf(zot, data["key"])
+
+    return {
+        "key": data["key"],
+        "title": data.get("title", ""),
+        "authors": authors,
+        "year": year,
+        "doi": data.get("DOI", ""),
+        "item_type": data["itemType"],
+        "url": data.get("url", ""),
+        "abstract": data.get("abstractNote", ""),
+        "collection_names": collection_names,
+        "has_pdf": has_pdf,
+        "journal": data.get("publicationTitle", ""),
+        "volume": data.get("volume", ""),
+        "issue": data.get("issue", ""),
+        "pages": data.get("pages", ""),
+    }
+
+
 def list_items(
     zot: zotero.Zotero | None = None,
     collection_key: str | None = None,
     check_pdf: bool = True,
+    max_items: int | None = None,
 ) -> list[dict]:
     """
     列出全部论文元数据（自动翻页）
@@ -118,6 +206,7 @@ def list_items(
     Args:
         collection_key: 指定 Collection 的 key，None 表示全部
         check_pdf: 是否逐篇检查有无 PDF（会额外调 children API）
+        max_items: 最大返回数量（可选），None 表示全量
 
     返回: [{
         "key": "ABC123",
@@ -134,75 +223,55 @@ def list_items(
     if zot is None:
         zot = _get_client()
 
-    # Pull Collection mapping first
     col_map = {}
     for col in list_collections(zot):
         col_map[col["key"]] = col["name"]
 
-    # Paginate to fetch all items
-    raw_items = _fetch_all_items(zot, collection_key)
+    raw_items = _fetch_all_items(zot, collection_key, max_items=max_items)
 
     result = []
     total = len(raw_items)
     for idx, item in enumerate(raw_items):
-        data = item["data"]
-
-        # Skip non-paper types
-        if data["itemType"] in _SKIP_TYPES:
+        extracted = _extract_item(item, col_map, zot=zot, check_pdf=check_pdf)
+        if extracted is None:
             continue
-
-        # Extract authors
-        authors = []
-        for creator in data.get("creators", []):
-            if creator.get("creatorType") == "author":
-                last = creator.get("lastName", "")
-                first = creator.get("firstName", "")
-                name = f"{last} {first}".strip()
-                if name:
-                    authors.append(name)
-
-        # Extract year
-        date_str = data.get("date", "")
-        year = None
-        if date_str:
-            try:
-                year = int(date_str[:4])
-            except (ValueError, IndexError):
-                pass
-
-        # Determine Collection - use Zotero folder name directly
-        collection_names = []
-        for col_key in data.get("collections", []):
-            col_name = col_map.get(col_key, "")
-            if col_name:
-                collection_names.append(col_name)
-
-        if not collection_names:
-            collection_names = [config.DEFAULT_COLLECTION]
-
-        # Check for PDF attachments (via child items)
-        has_pdf = False
-        if check_pdf:
-            has_pdf = _item_has_pdf(zot, data["key"])
-            if idx % 20 == 0 and idx > 0:
-                logger.info(f"  PDF 检查进度: {idx}/{total}")
-            time.sleep(0.1)  # 避免 API 限速
-
-        result.append({
-            "key": data["key"],
-            "title": data.get("title", ""),
-            "authors": authors,
-            "year": year,
-            "doi": data.get("DOI", ""),
-            "item_type": data["itemType"],
-            "url": data.get("url", ""),
-            "abstract": data.get("abstractNote", ""),
-            "collection_names": collection_names,
-            "has_pdf": has_pdf,
-        })
+        if check_pdf and idx % 20 == 0 and idx > 0:
+            logger.info(f"  PDF 检查进度: {idx}/{total}")
+            time.sleep(0.1)
+        result.append(extracted)
 
     logger.info(f"找到 {len(result)} 篇论文")
     return result
+
+
+def get_item_by_key(
+    item_key: str,
+    zot: zotero.Zotero | None = None,
+) -> dict | None:
+    """
+    直接通过 Zotero key 获取单篇论文元数据（单次 API 调用，无翻页）。
+
+    Args:
+        item_key: Zotero 论文 key
+        zot: Zotero 客户端（可选）
+
+    Returns: 统一格式的论文元数据 dict，或 None（未找到 / 非论文类型）
+    """
+    if zot is None:
+        zot = _get_client()
+
+    col_map = {}
+    for col in list_collections(zot):
+        col_map[col["key"]] = col["name"]
+
+    try:
+        full_item = zot.item(item_key)
+        if full_item:
+            return _extract_item(full_item, col_map)
+    except Exception as e:
+        logger.warning(f"Failed to get item {item_key}: {e}")
+
+    return None
 
 
 def get_item_pdf_keys(zot: zotero.Zotero | None = None, item_key: str = "") -> list[str]:
@@ -274,10 +343,25 @@ def download_pdf(
         papers_dir = config.PAPERS_DIR
         papers_dir.mkdir(parents=True, exist_ok=True)
         try:
+            # Resolve expected filename from attachment metadata before download
+            try:
+                child = zot.item(pdf_key)
+                filename = child["data"].get("filename", "")
+            except Exception:
+                filename = ""
+            if not filename:
+                filename = f"{pdf_key}.pdf"
+
             zot.dump(pdf_key, str(papers_dir))
+
+            expected = papers_dir / filename
+            if expected.exists() and expected.stat().st_size > 1000:
+                logger.info(f"PDF downloaded from Zotero API: {expected}")
+                return expected
+            # Fallback: scan for any new PDF (backward compat with renamed files)
             for f in papers_dir.iterdir():
-                if f.suffix == ".pdf":
-                    logger.info(f"PDF downloaded from Zotero API: {f}")
+                if f.suffix == ".pdf" and f.stat().st_size > 1000:
+                    logger.info(f"PDF downloaded from Zotero API (scan): {f}")
                     return f
         except Exception as e:
             logger.debug(f"API 下载失败: {e}")
@@ -320,8 +404,12 @@ def update_linked_file_path(item_key: str, new_path: str, zot=None) -> bool:
         for child in children:
             data = child['data']
             if data.get('linkMode') == 'linked_file' and data.get('contentType') == 'application/pdf':
-                data['path'] = str(new_path)
-                zot.update_item(data)
+                update_payload = {
+                    "key": data["key"],
+                    "version": data["version"],
+                    "path": str(new_path),
+                }
+                zot.update_item(update_payload)
                 logger.info(f'Updated linked_file for {item_key}: {new_path}')
                 return True
     except Exception as e:
@@ -348,7 +436,10 @@ def get_item_fulltext(zot: zotero.Zotero | None = None, item_key: str = "") -> s
 
 def list_folders(zot: zotero.Zotero | None = None) -> list[dict]:
     """
-    列出 Zotero 中所有 Collection（文件夹）及其论文数量。
+    列出 Zotero 中所有 Collection（文件夹）及其条目总数（含论文、笔记、附件等子条目）。
+
+    使用 num_collectionitems 逐 Collection 轻量查询（仅读取 Total-Results 响应头），
+    避免全量翻页拉取。
 
     返回: [{"key": "ABC123", "name": "钠电层状氧化物正极", "item_count": 45}, ...]
     """
@@ -356,23 +447,24 @@ def list_folders(zot: zotero.Zotero | None = None) -> list[dict]:
         zot = _get_client()
 
     collections = zot.collections()
+
     result = []
     for col in collections:
         data = col["data"]
-        # 获取该 Collection 的论文数量
+        col_key = data["key"]
         try:
-            items = zot.collection_items(data["key"], limit=1)
-            # pyzotero 返回的 items 没有 total_results，需要单独查询
-            # 用 items_top 获取总数更快
-            count = len(zot.collection_items(data["key"], limit=_PAGE_SIZE))
-        except Exception:
+            count = zot.num_collectionitems(col_key)
+        except Exception as e:
+            logger.warning(f"Failed to count items in '{data.get('name', '?')}': {e}")
             count = 0
         result.append({
-            "key": data["key"],
+            "key": col_key,
             "name": data["name"],
             "parent": data.get("parentCollection", ""),
             "item_count": count,
         })
+        time.sleep(0.1)
+
     logger.info(f"找到 {len(result)} 个 Collection")
     return result
 
@@ -399,18 +491,44 @@ def create_folder(name: str, parent: str | None = None, zot: zotero.Zotero | Non
             return col["key"]
 
     # 创建新 Collection
-    template = zot.item_template("collection")
-    template["name"] = name
+    payload = [{"name": name}]
     if parent:
-        template["parentCollection"] = parent
+        payload[0]["parentCollection"] = parent
 
-    response = zot.create_collections([template])
+    response = zot.create_collections(payload)
     if response.get("failed"):
         raise RuntimeError(f"创建 Collection 失败: {response['failed']}")
 
     new_key = response["success"]["0"]
     logger.info(f"Collection 已创建: {name} (key={new_key})")
     return new_key
+
+
+def add_to_collection(
+    item_key: str,
+    collection_key: str,
+    zot: zotero.Zotero | None = None,
+) -> bool:
+    """
+    将已有条目添加到指定 Collection。
+
+    Args:
+        item_key: Zotero 条目 key
+        collection_key: Collection key
+        zot: Zotero 客户端（可选）
+
+    Returns: True 成功，False 失败
+    """
+    if zot is None:
+        zot = _get_client()
+    try:
+        item = zot.item(item_key)
+        zot.addto_collection(collection_key, item)
+        logger.info(f"条目 {item_key} 已加入 Collection {collection_key}")
+        return True
+    except Exception as e:
+        logger.error(f"添加条目到 Collection 失败: {e}")
+        return False
 
 
 def get_item_metadata(identifier: str, zot: zotero.Zotero | None = None) -> dict | None:
@@ -447,17 +565,27 @@ def get_item_metadata(identifier: str, zot: zotero.Zotero | None = None) -> dict
     except Exception:
         pass
 
-    # 尝试 2: 按 DOI 查询（需要先拉取 items 再过滤）
+    # 尝试 2: 按 DOI 分页查询（提前终止，不拉全库）
     if identifier.startswith("10."):
-        items = list_items(zot, check_pdf=False)
-        for it in items:
-            if it.get("doi", "").lower() == identifier.lower():
-                # 重新拉取完整 item（list_items 返回的是精简版）
-                try:
-                    full_item = zot.item(it["key"])
-                    return _extract_full_metadata(full_item["data"])
-                except Exception:
-                    pass
+        start = 0
+        max_pages = 20  # safety cap: at most 2000 items scanned
+        for _ in range(max_pages):
+            try:
+                batch = zot.items(limit=_PAGE_SIZE, start=start)
+            except Exception:
+                break
+            if not batch:
+                break
+            for item in batch:
+                data = item["data"]
+                if data.get("itemType") in _SKIP_TYPES:
+                    continue
+                if data.get("DOI", "").lower() == identifier.lower():
+                    return _extract_full_metadata(data)
+            if len(batch) < _PAGE_SIZE:
+                break
+            start += _PAGE_SIZE
+            time.sleep(0.3)
 
     # 尝试 3: 按标题关键词查询（取前 4 个单词搜索）
     search_terms = identifier.split()[:4]

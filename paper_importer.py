@@ -209,11 +209,19 @@ def _download_scihub(doi: str, save_dir: Path) -> Path | None:
     return None
 
 
+def _is_valid_pdf(content: bytes) -> bool:
+    """PDF 文件必须以 %PDF 开头（ISO 32000 规范）"""
+    return len(content) >= 4 and content[:4] == b'%PDF'
+
+
 def _save_pdf(content: bytes, save_dir: Path, source: str) -> Path | None:
     """Save PDF content to file."""
     save_dir.mkdir(parents=True, exist_ok=True)
     if len(content) < 1000:
         logger.warning(f"PDF too small ({len(content)} bytes) from {source}")
+        return None
+    if not _is_valid_pdf(content):
+        logger.warning(f"Invalid PDF (bad magic bytes, got {content[:200]!r}) from {source}")
         return None
     filename = f"download_{source}.pdf"
     pdf_path = save_dir / filename
@@ -233,6 +241,9 @@ def _fetch_pdf(url: str, save_dir: Path, source: str) -> Path | None:
             if "pdf" not in content_type and "octet-stream" not in content_type:
                 logger.warning(f"URL returned non-PDF content-type: {content_type}")
                 return None
+            if not _is_valid_pdf(resp.content):
+                logger.warning(f"Invalid PDF (bad magic bytes, content-type={content_type}) from {source}")
+                return None
             filename = f"download_{source}.pdf"
             pdf_path = save_dir / filename
             pdf_path.write_bytes(resp.content)
@@ -247,12 +258,19 @@ def _fetch_pdf(url: str, save_dir: Path, source: str) -> Path | None:
         return None
 
 
+def _sanitize_filename_component(s: str) -> str:
+    """Replace characters illegal in Windows/NTFS filenames."""
+    for ch in r'<>:"/\|?*':
+        s = s.replace(ch, '_')
+    s = s.strip('. ')
+    return s or "unnamed"
+
+
 def _safe_filename(paper: dict) -> str:
     """Generate a unique filename for a paper (based on DOI or title hash) to avoid overwrites."""
     doi = paper.get("doi")
     if doi:
-        # Replace / with _ in DOI, strip prefix
-        safe = doi.replace("/", "_").replace(":", "_")
+        safe = _sanitize_filename_component(doi)
         return f"doi_{safe}.pdf"
     title = paper.get("title", "unknown")[:60]
     import hashlib
@@ -285,9 +303,67 @@ def _rename_to_unique(pdf: Path, paper: dict, save_dir: Path) -> Path:
     return final
 
 
+def _verify_pdf_match(pdf_path: Path, expected_title: str) -> bool:
+    """
+    Verify that downloaded PDF metadata title matches expected paper title.
+
+    Three-level fuzzy matching:
+      1. Partial containment (one title contained in the other)
+      2. SequenceMatcher ratio >= 0.6
+      3. Word-level overlap >= 50%
+
+    Returns False only when there is a clear mismatch.
+    Returns True when titles match or when PDF metadata is absent (cannot verify).
+    """
+    if not expected_title.strip():
+        return True
+
+    try:
+        import fitz
+        doc = fitz.open(str(pdf_path))
+        meta = doc.metadata
+        doc.close()
+    except Exception as e:
+        logger.warning(f"PDF metadata extraction failed: {e}, skipping verification")
+        return True
+
+    actual_title = (meta.get("title") or "").strip()
+    if not actual_title:
+        return True  # no embedded title, cannot verify — pass through
+
+    a_lower = actual_title.lower()
+    e_lower = expected_title.lower()
+
+    # Level 1: partial containment
+    if a_lower in e_lower or e_lower in a_lower:
+        return True
+
+    # Level 2: sequence similarity
+    from difflib import SequenceMatcher
+    ratio = SequenceMatcher(None, a_lower, e_lower).ratio()
+    if ratio >= 0.3:
+        return True
+
+    # Level 3: word-level overlap
+    import re
+    def _tokenize(s):
+        return set(re.findall(r'[a-z0-9]{3,}', s))
+
+    a_words = _tokenize(a_lower)
+    e_words = _tokenize(e_lower)
+    if a_words and e_words:
+        overlap = len(a_words & e_words)
+        min_words = min(len(a_words), len(e_words))
+        if overlap / max(min_words, 1) >= 0.25:
+            return True
+
+    return False  # all three levels failed, likely mismatched paper
+
+
 def download_pdf(
     paper: dict,
     save_dir: Path | None = None,
+    verify: bool = True,
 ) -> tuple[Path | None, str]:
     """
     6-level cascade PDF download.
@@ -310,10 +386,23 @@ def download_pdf(
     """
     doi = paper.get("doi")
     oa_url = paper.get("open_access_pdf")
+    expected_title = paper.get("title", "")
 
     if save_dir is None:
         save_dir = config.DATA_DIR / "downloads"
     save_dir.mkdir(parents=True, exist_ok=True)
+
+    def _accept(pdf_path: Path, source: str) -> tuple[Path, str] | None:
+        """Validate PDF match (if verify enabled) and return final path + source, or None to skip."""
+        final = _rename_to_unique(pdf_path, paper, save_dir)
+        if verify and expected_title:
+            if not _verify_pdf_match(final, expected_title):
+                logger.warning(
+                    f"  PDF metadata mismatch for '{expected_title[:60]}...', discarding PDF from {source}"
+                )
+                final.unlink(missing_ok=True)
+                return None
+        return final, source
 
     # 1) Local cache
     cached = _find_cached_pdf(paper, save_dir)
@@ -326,14 +415,18 @@ def download_pdf(
         logger.info(f"Trying OpenAlex OA: {oa_url[:80]}")
         pdf = _download_openalex(oa_url, save_dir)
         if pdf:
-            return _rename_to_unique(pdf, paper, save_dir), "openalex"
+            result = _accept(pdf, "openalex")
+            if result:
+                return result
         time.sleep(0.5)
 
     # 3) Unpaywall
     logger.info(f"Trying Unpaywall for DOI: {doi}")
     pdf = _download_unpaywall(doi, save_dir)
     if pdf:
-        return _rename_to_unique(pdf, paper, save_dir), "unpaywall"
+        result = _accept(pdf, "unpaywall")
+        if result:
+            return result
     time.sleep(0.5)
 
     # 4) CORE API
@@ -341,7 +434,9 @@ def download_pdf(
         logger.info(f"Trying CORE for DOI: {doi}")
         pdf = _download_core(doi, save_dir)
         if pdf:
-            return _rename_to_unique(pdf, paper, save_dir), "core"
+            result = _accept(pdf, "core")
+            if result:
+                return result
         time.sleep(0.5)
 
     # 5) arXiv (only for arxiv source or when OA URL is arxiv PDF)
@@ -350,7 +445,9 @@ def download_pdf(
         logger.info(f"Trying arXiv: {arxiv_url}")
         pdf = _download_arxiv(arxiv_url, save_dir)
         if pdf:
-            return _rename_to_unique(pdf, paper, save_dir), "arxiv"
+            result = _accept(pdf, "arxiv")
+            if result:
+                return result
         time.sleep(0.5)
 
     # 6) Sci-Hub mirror rotation
@@ -358,7 +455,9 @@ def download_pdf(
         logger.info(f"Trying Sci-Hub mirrors for DOI: {doi}")
         pdf = _download_scihub(doi, save_dir)
         if pdf:
-            return _rename_to_unique(pdf, paper, save_dir), "scihub"
+            result = _accept(pdf, "scihub")
+            if result:
+                return result
 
     logger.warning(f"All download methods failed for: {paper.get('title', '?')[:60]}")
     return None, "none"
@@ -372,12 +471,10 @@ def _find_in_zotero(doi: str, title: str = "") -> str | None:
     """
     Find existing item in Zotero (by DOI match).
 
-    Zotero API q param (full-text search) does not index the DOI field,
-    so we search by title keywords to narrow candidates, then filter by DOI.
-
-    Args:
-        doi: paper DOI
-        title: paper title (used to narrow search)
+    Strategy:
+      1. Title keyword search (fast, Zotero q= does NOT index DOI)
+      2. Direct DOI search via q= (may match DOI in notes/URL)
+      3. Full scan with safety cap via _fetch_all_items (retry-enabled, up to 1000 items)
 
     Returns: Zotero item key if found, else None
     """
@@ -385,20 +482,35 @@ def _find_in_zotero(doi: str, title: str = "") -> str | None:
         return None
     zot = zotero_sync._get_client()
     try:
-        # Use first few title keywords to narrow search
+        doi_lower = doi.lower()
+        skip_types = ("attachment", "note", "annotation")
+
+        # 1. Title keyword search (fast, narrows candidates)
         search_terms = title.split()[:4] if title else []
-        candidates = []
         if search_terms:
             query = " ".join(search_terms)
-            candidates = zot.items(q=query)
-        if not candidates:
-            # fallback: fetch recent items (limited)
-            candidates = zot.items(itemType="journalArticle", limit=200)
+            for item in zot.items(q=query):
+                data = item["data"]
+                if data.get("itemType") in skip_types:
+                    continue
+                if data.get("DOI", "").lower() == doi_lower:
+                    return data["key"]
+
+        # 2. Direct DOI search (may match via notes/URL/tags)
+        for item in zot.items(q=doi):
+            data = item["data"]
+            if data.get("itemType") in skip_types:
+                continue
+            if data.get("DOI", "").lower() == doi_lower:
+                return data["key"]
+
+        # 3. Full scan with safety cap (uses retry-enabled _fetch_all_items)
+        candidates = zotero_sync._fetch_all_items(zot, max_items=1000)
         for item in candidates:
             data = item["data"]
-            if data.get("itemType") in ("attachment", "note", "annotation"):
+            if data.get("itemType") in skip_types:
                 continue
-            if data.get("DOI", "").lower() == doi.lower():
+            if data.get("DOI", "").lower() == doi_lower:
                 return data["key"]
     except Exception as e:
         logger.warning(f"Zotero DOI lookup failed: {e}")
@@ -456,6 +568,29 @@ def import_to_zotero(
     """
     zot = zotero_sync._get_client()
 
+    # Deduplication: check if paper already exists by DOI/title match
+    doi = paper.get("doi", "")
+    title = paper.get("title", "")
+    existing_key = _find_in_zotero(doi, title)
+    if existing_key:
+        logger.info(f"Paper already in Zotero (key={existing_key}): {title[:60]}")
+        if collection_name:
+            try:
+                collections = zotero_sync.list_collections(zot)
+                col_key = None
+                for c in collections:
+                    if c["name"] == collection_name:
+                        col_key = c["key"]
+                        break
+                if col_key is None:
+                    col_key = zotero_sync.create_folder(collection_name, zot=zot)
+                    config.ensure_collection_mapping(collection_name)
+                zotero_sync.add_to_collection(existing_key, col_key, zot=zot)
+                logger.info(f"Added existing item {existing_key} to collection {collection_name}")
+            except Exception as e:
+                logger.warning(f"Failed to add existing item to collection: {e}")
+        return existing_key
+
     # Create item template
     template = zot.item_template("journalArticle")
     template["title"] = paper.get("title", "")
@@ -463,14 +598,23 @@ def import_to_zotero(
     template["date"] = str(paper.get("year", ""))
     template["abstractNote"] = paper.get("abstract", "")
     template["url"] = paper.get("url", "")
+    if paper.get("journal"):
+        template["publicationTitle"] = paper["journal"]
+    if paper.get("volume"):
+        template["volume"] = paper["volume"]
+    if paper.get("issue"):
+        template["issue"] = paper["issue"]
+    if paper.get("pages"):
+        template["pages"] = paper["pages"]
 
     # Authors
     creators = _parse_authors(paper.get("authors", []))
     if creators:
         template["creators"] = creators
 
-    # Add to Collection - set during creation
+    # Add to Collection - resolve or auto-create
     col_key = None
+    used_template_binding = False
     if collection_name:
         try:
             collections = zotero_sync.list_collections(zot)
@@ -480,10 +624,15 @@ def import_to_zotero(
                     break
             if col_key:
                 template["collections"] = [col_key]
+                used_template_binding = True
             else:
-                logger.warning(f"Collection not found: {collection_name}")
+                # Auto-create the missing collection
+                logger.info(f"Collection not found, auto-creating: {collection_name}")
+                col_key = zotero_sync.create_folder(collection_name, zot=zot)
+                logger.info(f"Auto-created collection: {collection_name} (key={col_key})")
+                config.ensure_collection_mapping(collection_name)
         except Exception as e:
-            logger.warning(f"Failed to resolve collection: {e}")
+            logger.warning(f"Failed to resolve or create collection '{collection_name}': {e}")
 
     try:
         response = zot.create_items([template])
@@ -517,34 +666,60 @@ def import_to_zotero(
         except Exception as e:
             logger.warning(f"Failed to create linked attachment: {e}")
 
+    # Fallback: add to collection after creation if not bound via template
+    if col_key and not used_template_binding:
+        try:
+            zotero_sync.add_to_collection(item_key, col_key, zot=zot)
+        except Exception as e:
+            logger.error(f"Failed to add item {item_key} to collection {collection_name}: {e}")
+
     return item_key
 
 
-def _archive_pdf(pdf_path: Path, paper: dict) -> Path:
+def _archive_pdf(pdf_path: Path, paper: dict, allow_rename: bool = True) -> Path:
     """
     将 PDF 从临时下载目录归档到永久存储 (data/papers/)。
-    linked_file 指向永久路径，临时文件可以清理。
+
+    使用 os.replace() 原子操作消除 TOCTOU 竞态窗口。
+    两个线程同时归档同一篇论文时，首个成功写入者为准。
+
+    Args:
+        pdf_path: 源 PDF 路径
+        paper: 论文元数据
+        allow_rename: True=激进模式（import 用）— 原子 move 到规范名；
+                      False=安全模式（ingest 用）— copy 到规范名，不删源文件
     """
     import shutil
+    import os as _os
+
     archive_name = _safe_filename(paper)
     archive_path = config.PAPERS_DIR / archive_name
 
+    # 规范名文件已存在，清理临时文件
     if archive_path.exists():
-        # Already archived, just clean up the temp file
         if pdf_path != archive_path and pdf_path.exists():
-            pdf_path.unlink(missing_ok=True)
-            logger.info(f"PDF already archived, cleaned temp: {pdf_path.name}")
+            if allow_rename:
+                pdf_path.unlink(missing_ok=True)
+                logger.info(f"PDF already archived, cleaned temp: {pdf_path.name}")
         return archive_path
 
-    # Move (not copy) from temp to permanent
+    # 已在 papers/ 中
     if pdf_path.parent == config.PAPERS_DIR:
-        # Already in the right dir, just rename
-        if pdf_path.name != archive_name:
-            pdf_path.rename(archive_path)
-        return archive_path
+        if allow_rename and pdf_path.name != archive_name:
+            shutil.move(str(pdf_path), str(archive_path))
+            logger.info(f"PDF renamed in papers/: {pdf_path.name} → {archive_name}")
+            return archive_path
+        return pdf_path
 
-    shutil.move(str(pdf_path), str(archive_path))
-    logger.info(f"PDF archived: {pdf_path.name} → {archive_path}")
+    # 来自外部目录 (downloads/ Zotero storage 等)
+    if allow_rename:
+        shutil.move(str(pdf_path), str(archive_path))
+        logger.info(f"PDF archived: {pdf_path.name} → {archive_path}")
+    else:
+        tmp = archive_path.with_suffix(archive_path.suffix + '.tmp')
+        shutil.copy2(str(pdf_path), str(tmp))
+        _os.replace(str(tmp), str(archive_path))
+        logger.info(f"PDF copied to papers/: {pdf_path.name} → {archive_path}")
     return archive_path
 
 
@@ -659,10 +834,15 @@ def fetch_and_ingest(
             "doi": doi or "",
             "url": paper.get("url", ""),
             "abstract": paper.get("abstract", ""),
+            "journal": paper.get("journal", ""),
+            "volume": paper.get("volume", ""),
+            "issue": paper.get("issue", ""),
+            "pages": paper.get("pages", ""),
             "collection_names": [collection_name] if collection_name else [config.DEFAULT_COLLECTION],
         }
 
-        chunks_added = mcp_server._ingest_paper(target_item, force_parse=force, pdf_path=str(pdf_path))
+        ingest_result = mcp_server._ingest_paper(target_item, force_parse=force, pdf_path=str(pdf_path))
+        chunks_added = ingest_result["added"]
 
         return {
             "status": "success",

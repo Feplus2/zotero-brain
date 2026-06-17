@@ -29,19 +29,23 @@ _POLL_INTERVAL_START = 2.0
 _POLL_INTERVAL_MAX = 30.0
 
 
-def _count_pages(pdf_path: str) -> int:
-    """Get total page count of PDF"""
+def _count_pages(pdf_path: str) -> int | None:
+    """Get total page count of PDF. Returns None if counting fails (corrupted PDF)."""
     try:
         import fitz  # PyMuPDF
         doc = fitz.open(pdf_path)
         n = doc.page_count
         doc.close()
         return n
-    except ImportError:
-        # Fall back to pypdf if PyMuPDF is not available
+    except Exception:
+        pass
+    try:
         from pypdf import PdfReader
         reader = PdfReader(pdf_path)
         return len(reader.pages)
+    except Exception:
+        pass
+    return None
 
 
 def _get_upload_urls(client: httpx.Client, file_paths: list[str], opts: dict, ocr: bool, pages: str | None) -> str:
@@ -186,8 +190,12 @@ def parse_pdf(
 
     # Get page count, determine if chunking is needed
     total_pages = _count_pages(str(pdf_path))
-    chunks_needed = (total_pages + CHUNK_SIZE - 1) // CHUNK_SIZE
-    logger.info(f"  {total_pages} pages, {chunks_needed} chunk(s)")
+    if total_pages is None:
+        logger.warning(f"  Cannot count pages (PDF may be corrupted), submitting entire file")
+        chunks_needed = 1
+    else:
+        chunks_needed = max(1, (total_pages + CHUNK_SIZE - 1) // CHUNK_SIZE)
+        logger.info(f"  {total_pages} pages, {chunks_needed} chunk(s)")
 
     # Build options
     opts = {
@@ -207,9 +215,12 @@ def parse_pdf(
         all_markdown = []
 
         for chunk_idx in range(chunks_needed):
-            start_page = chunk_idx * CHUNK_SIZE + 1
-            end_page = min(start_page + CHUNK_SIZE - 1, total_pages)
-            page_range = f"{start_page}-{end_page}"
+            if total_pages is None:
+                page_range = None  # no page limit, entire file
+            else:
+                start_page = chunk_idx * CHUNK_SIZE + 1
+                end_page = min(start_page + CHUNK_SIZE - 1, total_pages)
+                page_range = f"{start_page}-{end_page}"
 
             if chunks_needed > 1:
                 logger.info(f"  Chunk {chunk_idx + 1}/{chunks_needed}: pages {start_page}-{end_page}")
@@ -261,6 +272,44 @@ def parse_pdf(
 
         logger.info(f"Parse complete: {pdf_path.name} -> {len(merged_md):,} chars")
         return merged_md
+
+
+def extract_pdf_metadata(pdf_path: Path) -> dict:
+    """从 PDF 内嵌元数据中提取标题、作者、年份。
+
+    Args:
+        pdf_path: PDF 文件路径
+
+    Returns: {"title": str, "authors": list[str], "year": int|None}
+    """
+    import re as _re
+    try:
+        import fitz
+        doc = fitz.open(str(pdf_path))
+        meta = doc.metadata
+        doc.close()
+    except ImportError:
+        meta = {}
+    except Exception as e:
+        logger.warning(f"PDF metadata extraction failed: {e}")
+        meta = {}
+
+    title = (meta.get("title") or "").strip()
+    author_raw = (meta.get("author") or "").strip()
+    authors = [a.strip() for a in author_raw.split(";") if a.strip()] if author_raw else []
+
+    year = None
+    for field in ["creationDate", "modDate", "subject"]:
+        val = meta.get(field, "")
+        m = _re.search(r"(?:19|20)\d{2}", str(val))
+        if m:
+            year = int(m.group())
+            break
+
+    if not title:
+        title = pdf_path.stem
+
+    return {"title": title, "authors": authors, "year": year}
 
 
 def parse_from_zotero_pdf(

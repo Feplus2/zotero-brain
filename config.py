@@ -3,6 +3,7 @@
 import os
 import json
 import logging
+import threading
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -63,43 +64,100 @@ ZHIPU_MAX_CHARS = 6000     # Safe truncation for ~3072 tokens
 _NAME_MAP_FILE = DATA_DIR / "collection_map.json"
 
 def _load_name_map() -> dict:
+    import re as _re
     if _NAME_MAP_FILE.exists():
-        return json.loads(_NAME_MAP_FILE.read_text("utf-8"))
+        raw = json.loads(_NAME_MAP_FILE.read_text("utf-8"))
+        result = {}
+        for cn, val in raw.items():
+            if isinstance(val, str):
+                is_auto = bool(_re.match(r'^col-[a-f0-9]{10}$', val))
+                result[cn] = {"slug": val, "auto": is_auto}
+            elif isinstance(val, dict):
+                result[cn] = {"slug": val.get("slug", ""), "auto": val.get("auto", False)}
+        return result
     return {}
 
 def _save_name_map(m: dict):
     _NAME_MAP_FILE.write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
 
 _NAME_MAP = _load_name_map()
+_name_lock = threading.Lock()
+
+def _get_slug(chinese_name: str) -> str | None:
+    entry = _NAME_MAP.get(chinese_name)
+    if entry is None:
+        return None
+    if isinstance(entry, str):
+        return entry
+    return entry.get("slug")
+
+def _has_auto_slug(chinese_name: str) -> bool:
+    entry = _NAME_MAP.get(chinese_name)
+    if entry is None:
+        return False
+    if isinstance(entry, str):
+        return entry.startswith("col-")
+    return entry.get("auto", False)
 
 def translate_collection_name(chinese_name: str) -> str:
     """中文 Collection 名 → ChromaDB 安全名（纯查映射表，不再调 DeepSeek）"""
     if not chinese_name or chinese_name == "uncategorized":
         return "uncategorized"
-    if chinese_name in _NAME_MAP:
-        return _NAME_MAP[chinese_name]
-    # 未找到映射 → 报错，要求先用 create_collection 创建
-    raise ValueError(
-        f"Collection '{chinese_name}' 未找到映射。"
-        f"请先用 create_collection(folder_name='...', chroma_name='english-slug') 创建。"
-    )
+    with _name_lock:
+        slug = _get_slug(chinese_name)
+        if slug is not None:
+            return slug
+    return ensure_collection_mapping(chinese_name)
 
-def register_collection_mapping(chinese_name: str, chroma_name: str):
+def register_collection_mapping(chinese_name: str, chroma_name: str, auto: bool = False):
     """注册中文名 → ChromaDB 英文名的映射（由 create_collection 工具调用）"""
     import re
-    # 校验 chroma_name 合法性
     if not re.match(r'^[a-z0-9][a-z0-9._-]{1,510}[a-z0-9]$', chroma_name):
         raise ValueError(
             f"ChromaDB 名称 '{chroma_name}' 不合法。"
             f"要求: 3-512 字符, [a-z0-9._-], 首尾必须 a-z0-9"
         )
-    _NAME_MAP[chinese_name] = chroma_name
-    _save_name_map(_NAME_MAP)
-    logger.info(f"Collection 映射已注册: '{chinese_name}' → '{chroma_name}'")
+    with _name_lock:
+        _NAME_MAP[chinese_name] = {"slug": chroma_name, "auto": auto}
+        _save_name_map(_NAME_MAP)
+    label = "auto-generated" if auto else "registered"
+    logger.info(f"Collection 映射已{label}: '{chinese_name}' → '{chroma_name}'")
+
+def ensure_collection_mapping(col_name: str) -> str:
+    """确保 Collection 有中英文映射。已有则直接返回 slug，缺失则自动生成并注册。
+
+    返回: ChromaDB 安全名 (slug)
+    """
+    if col_name == DEFAULT_COLLECTION:
+        return "uncategorized"
+    with _name_lock:
+        slug = _get_slug(col_name)
+        if slug is not None:
+            return slug
+    import hashlib
+    h = hashlib.md5(col_name.encode()).hexdigest()[:10]
+    slug = f"col-{h}"
+    register_collection_mapping(col_name, slug, auto=True)
+    logger.warning(
+        f"⚠ 自动生成 Collection slug: '{col_name}' → '{slug}'。"
+        f"建议通过 create_collection 工具设置规范英文名。"
+    )
+    return slug
 
 def get_display_name(chroma_name: str) -> str:
     """ChromaDB 名 → 中文显示名（反向查找）"""
-    for zh, en in _NAME_MAP.items():
-        if en == chroma_name:
-            return zh
+    with _name_lock:
+        for zh, entry in _NAME_MAP.items():
+            en = entry if isinstance(entry, str) else entry.get("slug", "")
+            if en == chroma_name:
+                return zh
     return chroma_name
+
+
+def get_name_map_snapshot() -> dict:
+    """返回映射表的只读快照（线程安全）。用于 list_collections 等需要遍历的场景。"""
+    with _name_lock:
+        return {
+            cn: entry if isinstance(entry, dict) else {"slug": entry, "auto": True}
+            for cn, entry in _NAME_MAP.items()
+        }

@@ -6,6 +6,9 @@ Vector Store — ChromaDB 多集合管理
 中文 display_name 存在 metadata 里
 """
 import logging
+import json as _json
+from datetime import datetime as _dt, timezone as _tz
+
 import chromadb
 from chromadb.config import Settings
 
@@ -15,12 +18,31 @@ from embedder import embed_batch
 
 logger = logging.getLogger(__name__)
 
+_SKIP_LOG_PATH = config.DATA_DIR / "skipped_chunks.jsonl"
 
-def _client() -> chromadb.ClientAPI:
-    return chromadb.PersistentClient(
-        path=str(config.CHROMA_DIR),
-        settings=Settings(anonymized_telemetry=False),
-    )
+
+def _save_skip_log(skipped_details: list[dict], collection_name: str):
+    """追加写入跳过的 chunk 到持久化日志，供后续人工/自动恢复。"""
+    for sd in skipped_details:
+        entry = {
+            **sd,
+            "collection": collection_name,
+            "timestamp": _dt.now(_tz.utc).isoformat(),
+        }
+        with open(_SKIP_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(_json.dumps(entry, ensure_ascii=False) + "\n")
+
+_client_singleton: chromadb.ClientAPI | None = None
+
+
+def _get_client() -> chromadb.ClientAPI:
+    global _client_singleton
+    if _client_singleton is None:
+        _client_singleton = chromadb.PersistentClient(
+            path=str(config.CHROMA_DIR),
+            settings=Settings(anonymized_telemetry=False),
+        )
+    return _client_singleton
 
 
 def _get_collection(client: chromadb.ClientAPI, name: str) -> chromadb.Collection:
@@ -32,11 +54,21 @@ def _get_collection(client: chromadb.ClientAPI, name: str) -> chromadb.Collectio
     )
 
 
-def add_chunks(chunks: list[Chunk], collection_name: str) -> int:
+def add_chunks(chunks: list[Chunk], collection_name: str) -> dict:
     if not chunks:
-        return 0
-    client = _client()
+        return {"added": 0, "skipped": 0, "skipped_details": []}
+    client = _get_client()
     col = _get_collection(client, collection_name)
+
+    # Delete old chunks for these papers before inserting new ones
+    paper_keys = set(
+        c.metadata.get("key") for c in chunks if c.metadata.get("key")
+    )
+    for pk in paper_keys:
+        existing = col.get(where={"key": pk})
+        if existing["ids"]:
+            col.delete(ids=existing["ids"])
+            logger.info(f"  清理旧 chunk: paper={pk}, count={len(existing['ids'])}")
 
     ids = [f"{c.metadata.get('key', '?')}_{c.metadata.get('chunk_index', i)}"
            for i, c in enumerate(chunks)]
@@ -46,14 +78,41 @@ def add_chunks(chunks: list[Chunk], collection_name: str) -> int:
     logger.info(f"  向量化 {len(docs)} chunks...")
     vecs = embed_batch(docs)
 
-    col.add(ids=ids, documents=docs, metadatas=metas, embeddings=vecs)
-    logger.info(f"  ✓ {len(ids)} chunks → {col.name}")
-    return len(ids)
+    skipped_details = []
+    valid_ids, valid_docs, valid_metas, valid_vecs = [], [], [], []
+    for i, (chunk, vec) in enumerate(zip(chunks, vecs)):
+        if vec is None:
+            skipped_details.append({
+                "chunk_index": chunk.metadata.get("chunk_index", i),
+                "section": chunk.metadata.get("section", ""),
+                "text_preview": chunk.text[:100],
+            })
+        else:
+            valid_ids.append(ids[i])
+            valid_docs.append(chunk.text)
+            valid_metas.append(chunk.metadata)
+            valid_vecs.append(vec)
+
+    if skipped_details:
+        _save_skip_log(skipped_details, collection_name)
+        logger.warning(f"  ⚠ {len(skipped_details)}/{len(chunks)} chunks 嵌入失败，已跳过")
+        for sd in skipped_details:
+            logger.warning(f"    跳过 [chunk {sd['chunk_index']}] {sd['section'][:30]}: {sd['text_preview'][:60]}...")
+
+    if valid_ids:
+        col.upsert(ids=valid_ids, documents=valid_docs, metadatas=valid_metas, embeddings=valid_vecs)
+        logger.info(f"  ✓ {len(valid_ids)} chunks → {col.name}")
+
+    return {
+        "added": len(valid_ids),
+        "skipped": len(skipped_details),
+        "skipped_details": skipped_details,
+    }
 
 
 def search(query: str, collection_names: list[str] | None = None,
            n_results: int = 10, paper_keys: list[str] | None = None) -> list[dict]:
-    client = _client()
+    client = _get_client()
 
     if collection_names is None:
         cols = [c.name for c in client.list_collections()]
@@ -64,6 +123,8 @@ def search(query: str, collection_names: list[str] | None = None,
         return []
 
     qvec = embed_batch([query])[0]
+    if qvec is None:
+        return []
 
     # Build ChromaDB where filter
     where_filter = None
@@ -95,7 +156,7 @@ def search(query: str, collection_names: list[str] | None = None,
 
 
 def list_collections() -> list[dict]:
-    client = _client()
+    client = _get_client()
     return [
         {"name": config.get_display_name(c.name), "safe_name": c.name,
          "count": c.count()}
@@ -105,7 +166,7 @@ def list_collections() -> list[dict]:
 
 def get_paper_keys(collection_name: str) -> set[str]:
     safe = config.translate_collection_name(collection_name)
-    client = _client()
+    client = _get_client()
     col = _get_collection(client, collection_name)
     r = col.get(include=["metadatas"])
     return {m["key"] for m in r["metadatas"] if "key" in m}
@@ -116,7 +177,7 @@ def exists_by_metadata(field: str, value: str) -> bool:
     在任意 collection 中检查是否存在 metadata 字段精确匹配的条目。
     用于去重判断（DOI / title 匹配），比语义搜索快且准。
     """
-    client = _client()
+    client = _get_client()
     for c in client.list_collections():
         try:
             r = c.get(where={field: value}, include=[], limit=1)
@@ -128,7 +189,7 @@ def exists_by_metadata(field: str, value: str) -> bool:
 
 
 def delete_paper(paper_key: str, collection_name: str) -> int:
-    col = _get_collection(_client(), collection_name)
+    col = _get_collection(_get_client(), collection_name)
     r = col.get(where={"key": paper_key})
     if r["ids"]:
         col.delete(ids=r["ids"])
@@ -152,10 +213,13 @@ def get_chunks_by_key(paper_key: str, collection_name: str | None = None) -> lis
     返回: [{"chunk_index": int, "section": str, "summary": str}, ...]
     summary 是前 120 字，用于预览而非全文。
     """
-    client = _client()
+    client = _get_client()
 
     if collection_name:
-        cols = [client.get_collection(config.translate_collection_name(collection_name))]
+        try:
+            cols = [client.get_collection(config.translate_collection_name(collection_name))]
+        except Exception:
+            return []
     else:
         col = _find_col_for_paper(paper_key, client)
         if col is None:
@@ -201,10 +265,13 @@ def get_context(
 
     返回: [{"chunk_index": int, "section": str, "text": str}, ...]
     """
-    client = _client()
+    client = _get_client()
 
     if collection_name:
-        col = client.get_collection(config.translate_collection_name(collection_name))
+        try:
+            col = client.get_collection(config.translate_collection_name(collection_name))
+        except Exception:
+            return []
     else:
         col = _find_col_for_paper(paper_key, client)
         if col is None:
@@ -283,6 +350,8 @@ def create_collection(
     """
     创建 ChromaDB Collection，同时注册中英文映射 + 写入 Zotero 关联 metadata。
 
+    当 collection_name 已有 auto-generated slug 时，自动将旧 Collection 数据迁移到新名称。
+
     Args:
         collection_name: 中文名（如 "钠电层状氧化物正极"）
         chroma_name: ChromaDB 安全名（如 "sodium-layered-oxide-cathode"）
@@ -290,10 +359,33 @@ def create_collection(
 
     Returns: ChromaDB collection name
     """
+    client = _get_client()
+
+    # Migrate data from auto-generated collection if one exists for this Chinese name
+    old_slug = config.translate_collection_name(collection_name) if collection_name != config.DEFAULT_COLLECTION else None
+    if old_slug and old_slug != chroma_name and config._has_auto_slug(collection_name):
+        try:
+            old_col = client.get_collection(old_slug)
+            old_data = old_col.get(include=["embeddings", "documents", "metadatas"])
+            if old_data["ids"]:
+                new_col = client.get_or_create_collection(name=chroma_name)
+                new_col.upsert(
+                    ids=old_data["ids"],
+                    embeddings=old_data["embeddings"],
+                    documents=old_data["documents"],
+                    metadatas=old_data["metadatas"],
+                )
+                logger.info(
+                    f"Migrated {len(old_data['ids'])} chunks: '{old_slug}' → '{chroma_name}'"
+                )
+            client.delete_collection(old_slug)
+            logger.info(f"Deleted auto-generated collection: '{old_slug}'")
+        except Exception as e:
+            logger.warning(f"Collection migration from '{old_slug}' failed (non-fatal): {e}")
+
     # 注册映射（会校验 chroma_name 合法性）
     config.register_collection_mapping(collection_name, chroma_name)
 
-    client = _client()
     metadata = {
         "hnsw:space": "cosine",
         "display_name": collection_name,
@@ -308,9 +400,22 @@ def create_collection(
 
 def get_collection_metadata(chroma_name: str) -> dict | None:
     """获取 Collection 的 metadata（display_name, zotero_folder_key 等）"""
-    client = _client()
+    client = _get_client()
     try:
         col = client.get_collection(chroma_name)
         return col.metadata
     except Exception:
         return None
+
+
+def list_skipped_chunks() -> list[dict]:
+    """读取持久化跳过的 chunk 列表，供 Agent 查询哪些段落未入库。"""
+    if not _SKIP_LOG_PATH.exists():
+        return []
+    results = []
+    with open(_SKIP_LOG_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                results.append(_json.loads(line))
+    return results

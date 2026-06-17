@@ -131,6 +131,8 @@ def _split_long_text(text: str, max_size: int) -> list[str]:
             # Split paragraph by sentences
             sentences = _split_into_sentences(para)
             for sent in sentences:
+                if len(sent) > max_size:
+                    sent = sent[:max_size - 3] + "..."
                 if current_size + len(sent) > max_size and current_chunk:
                     chunks.append("\n\n".join(current_chunk))
                     current_chunk = []
@@ -156,23 +158,29 @@ def _split_long_text(text: str, max_size: int) -> list[str]:
 
 
 def _split_into_sentences(text: str) -> list[str]:
-    """按句子切分（中文句号、问号、感叹号）"""
-    # Chinese sentence delimiters
-    sentence_endings = re.compile(r"([。！？])")
-    
+    """按句子切分：中文优先，无中文边界则回退英文断句。"""
+    cn_pattern = re.compile(r"([。！？])")
+    parts = cn_pattern.split(text)
+
     sentences = []
-    parts = sentence_endings.split(text)
-    
     for i in range(0, len(parts) - 1, 2):
         sent = parts[i] + (parts[i + 1] if i + 1 < len(parts) else "")
         if sent.strip():
             sentences.append(sent)
-    
-    # Last segment
     if len(parts) % 2 == 1 and parts[-1].strip():
         sentences.append(parts[-1])
-    
+
+    if len(sentences) <= 1:
+        sentences = _split_english_sentences(text)
+
     return sentences
+
+
+def _split_english_sentences(text: str) -> list[str]:
+    """Split by English sentence endings (.!?) followed by space and capital letter."""
+    pattern = re.compile(r'(?<=[.!?])\s+(?=[A-Z])')
+    raw = pattern.split(text)
+    return [s.strip() for s in raw if s.strip()]
 
 
 if __name__ == "__main__":
