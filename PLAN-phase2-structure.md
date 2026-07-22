@@ -30,6 +30,8 @@
 | 8 | `paper_importer.py:520-546` | `_parse_authors` 把 2-token 名按 "Last First" 解析，但 OpenAlex/S2 的 display_name 是 "First Last" → **姓名颠倒写入 Zotero**，污染 BibTeX |
 | 9 | `zotero_sync.py:362-365` | 附件文件名不匹配时 fallback 抓 `papers_dir` 里任意 >1000 字节的 PDF，可能错配别人的 PDF |
 
+> **✅ P1 健壮性 6 项已修复 (2026-07-22)**：#4 缓存检查/读取统一为 `_cached_parse_path()`（key 命名优先、stem 兜底）；#5 超时分支改为 salvage——已完成的照常下载缓存（与全完成分支共用 `_collect_result`）；#6 `ingest_resume` 单篇 try/except + 按 collection 逐个判断缺失（只补缺的库）；#7 迁移创建带 `hnsw:space=cosine` metadata；#8 作者格式统一为 "First Last"（最后词为姓），同步修正 `mcp_server` schema 与两处 docstring 的错误契约；#9 下载 fallback 只认本次新出现的文件。离线测试 4 项全过（#8 解析、#4 路径一致性、#6 端到端 mock、#7 迁移端到端）；#5 与 #9 未实弹测试（需 mock MinerU 批次/真实 Zotero 下载），靠代码审查 + 共用逻辑保证。
+
 ### P2 — 质量改进（不紧急）
 
 - `embedder.py:18` 全局 httpx client 永不关闭；`:24-25` 429/5xx 不重试、限流只靠固定 sleep 0.3s；`:55-56` 返回条数不足时 zip 静默丢尾部 chunk 且无日志。
@@ -175,7 +177,7 @@ attach_to_zotero(item_key, html_path, title="AI 解读", content_type="text/html
 
 | 阶段 | 内容 | 验收 | 预估 |
 |------|------|------|------|
-| **P0 修 bug** ✅ 已完成 (2026-07-22) | 第一节 P0×3 + 轮询响应格式兼容（P1×6 健壮性修复待做） | ✅ 实测通过（见上方修复记录）；>200 页分片与批量配对留待真实批量入库验证 | 实际 0.3 会话 |
+| **P0 修 bug** ✅ 已完成 (2026-07-22) | 第一节 P0×3 + 轮询响应格式兼容 + **P1×6 健壮性（同日完成）** | ✅ 实测通过（见上方两条修复记录）；>200 页分片与批量配对留待真实批量入库验证 | 实际 0.3 会话 |
 | **P1 结构信号保留** ✅ 已完成 (2026-07-22) | ① `*_content_list.json` 随解析落盘 `parsed/{key}/`；② chunker 新增 `chunk_content_list`（层级只信论文编号不信 text_level、图/表/chart 独立 chunk 不丢弃、caption 去重、页码进 metadata）+ `chunk_auto` 统一入口、md 兜底；③ `read_paper_full` 加 offset/limit 分段 | ✅ 离线测试 4 项全过 + 真实论文（2H42SNB3, vlm 全量解析）验收：112 chunks = 82 text + 10 figure + 20 chart，0 裸图片引用，层级正确；旧缓存无 content_list 自动走 md 兜底。发现并处理：vlm 输出的曲线图是 `chart` 块（非 `image`），20/30 张图差点漏掉 | 实际 0.5 会话 |
 | **P2 解读工具闭环** ✅ 已完成 (2026-07-22) | 3 个新 MCP 工具：`get_paper_structure`（章节树，编号层级+页码+节字数）、`get_paper_images`（图片+caption+绝对路径，供多模态读图）、`attach_to_zotero`（linked_file 附件）+ `config.REPORTS_DIR` + SKILL 工作流 | ✅ extract_structure 离线测试（合成块+真实 md 兜底）；attach 回环实测：创建→children 验证→raw HTTP 删除→零残留。按用户决定：**不内置 HTML 模板与解读风格 prompt**（风格归用户，工具归项目） | 实际 0.5 会话 |
 | **P3 批量翻译（可选）** | 移植 stage4_translate，复用智谱 key，入库后自动生成中文译文 HTML 挂附件 | 一篇论文后台翻译完成，术语一致，断点续翻可用 | 1 会话 |
