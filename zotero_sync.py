@@ -353,7 +353,8 @@ def download_pdf(
                 filename = f"{pdf_key}.pdf"
 
             before = set(papers_dir.iterdir())
-            zot.dump(pdf_key, str(papers_dir))
+            # pyzotero dump(itemkey, filename, path)：第二参数是文件名、第三才是目录
+            zot.dump(pdf_key, filename, str(papers_dir))
 
             expected = papers_dir / filename
             if expected.exists() and expected.stat().st_size > 1000:
@@ -368,7 +369,7 @@ def download_pdf(
                     logger.info(f"PDF downloaded from Zotero API (scan): {f}")
                     return f
         except Exception as e:
-            logger.debug(f"API 下载失败: {e}")
+            logger.warning(f"API 下载失败: {e}")
 
     logger.error(f"无法获取 PDF: {item_key}")
     return None

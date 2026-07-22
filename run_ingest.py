@@ -47,7 +47,14 @@ import config
 import zotero_sync
 import pdf_parser
 import chunker
+import network_helper
 import vector_store
+
+# Install MinerU TUN direct-connect patch (same as mcp_server startup)
+try:
+    network_helper.install()
+except Exception as e:
+    logger.warning(f"Network helper install failed (MinerU direct-connect may not work): {e}")
 
 # Number of files per MinerU batch submission
 MINERU_BATCH_SIZE = 20
@@ -334,6 +341,24 @@ def run(
         print("=" * 60)
         print("  Phase 2: MinerU 批量解析")
         print("=" * 60)
+
+        # 超过 MinerU 单任务 200 页上限的 PDF 不进批次，走单篇分片路径（pdf_parser.parse_pdf）
+        normal: list[tuple] = []
+        for item, pdf_path in need_parse:
+            n_pages = pdf_parser._count_pages(str(pdf_path))
+            if n_pages and n_pages > pdf_parser.CHUNK_SIZE:
+                logger.info(
+                    f"  [{item['key']}] {n_pages} pages > {pdf_parser.CHUNK_SIZE}, single-paper sliced parse"
+                )
+                try:
+                    md = pdf_parser.parse_pdf(pdf_path, item_key=item["key"], force=True)
+                    if md and md.strip():
+                        parsed[item["key"]] = (item, md)
+                except Exception as e:
+                    logger.error(f"  {item['key']}: oversized parse failed: {e}")
+            else:
+                normal.append((item, pdf_path))
+        need_parse = normal
 
         http_client = httpx.Client(
             headers={"Authorization": f"Bearer {config.MINERU_TOKEN}"},

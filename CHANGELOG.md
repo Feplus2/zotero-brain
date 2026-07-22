@@ -27,7 +27,8 @@
 - 作者名格式契约统一为 `First Last`（最后一个词为姓），与 OpenAlex/arXiv 等数据源一致
 
 > **升级提醒**：存量论文是旧模型 + 旧逻辑解析的。建议择机重跑
-> `.venv\Scripts\python.exe run_ingest.py --force-parse`，一次性应用 vlm 模型、新切块与 content_list 缓存。
+> `.venv\Scripts\python.exe run_ingest.py --no-incremental --force-parse`（全量重新解析 + 重新入库），
+> 一次性应用 vlm 模型、新切块与 content_list 缓存。
 
 ## [0.1.0] - 2026-06-12
 
