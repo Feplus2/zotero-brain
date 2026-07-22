@@ -3,7 +3,7 @@
 MCP Server - expose Zotero Brain to WorkBuddy.
 
 Phase 4: 工具解耦 + Zotero-First 设计
-Tools provided (11):
+Tools provided (14):
   - search_papers: semantic search in library (supports paper_keys filter)
   - discover_papers: discover new papers from academic databases
   - download_paper: 6-level cascade PDF download (pure download, no Zotero/ChromaDB)
@@ -14,7 +14,10 @@ Tools provided (11):
   - get_bibtex: generate BibTeX (exact mode + semantic recommend mode)
   - get_paper_chunks: list paper chunk structure
   - expand_context: context expansion around a chunk
-  - read_paper_full: read full paper text
+  - read_paper_full: read full paper text (offset/limit pagination)
+  - get_paper_structure: 章节结构树（来自 content_list，含页码/节字数）
+  - get_paper_images: 论文图片清单（caption + 页码 + 绝对路径，供多模态读图）
+  - attach_to_zotero: 挂载 linked_file 附件到 Zotero 条目（解读/翻译报告回挂）
 """
 
 import logging
@@ -563,6 +566,61 @@ async def list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["paper_key"],
+            },
+        ),
+        Tool(
+            name="get_paper_structure",
+            description="获取论文的章节结构树（标题层级、页码、每节字数）。层级只来自论文自己的编号（1/1.1/1.1.1），不信 MinerU text_level。用于规划深度阅读、按节生成解读/翻译。数据来自 MinerU content_list 缓存；无缓存时回退 Markdown 标题（无页码）。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "paper_key": {
+                        "type": "string",
+                        "description": "Zotero 论文 key",
+                    },
+                },
+                "required": ["paper_key"],
+            },
+        ),
+        Tool(
+            name="get_paper_images",
+            description="列出论文的所有图片（含 chart 曲线图）：文件名、绝对路径、页码、caption、是否含 VLM 描述。具备多模态读图能力的 Agent 可按路径直接查看图片，用于生成图文解读或核对图文对应关系。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "paper_key": {
+                        "type": "string",
+                        "description": "Zotero 论文 key",
+                    },
+                },
+                "required": ["paper_key"],
+            },
+        ),
+        Tool(
+            name="attach_to_zotero",
+            description="把本地文件作为 linked_file 附件挂到 Zotero 条目上（Zotero 里双击用系统默认程序打开）。典型用法：Agent 生成论文解读/翻译 HTML 后挂载到对应条目。文件本体不上传 Zotero 云端；跨设备访问需文件所在目录走坚果云等外部同步。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "item_key": {
+                        "type": "string",
+                        "description": "Zotero 条目 key（论文父条目）",
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "本地文件绝对路径（建议放 data/reports/ 下）",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "附件显示名（默认用文件名）",
+                    },
+                    "content_type": {
+                        "type": "string",
+                        "description": "MIME 类型，默认 text/html；Markdown 用 text/markdown，PDF 用 application/pdf",
+                        "default": "text/html",
+                    },
+                },
+                "required": ["item_key", "file_path"],
             },
         ),
     ]
@@ -1251,6 +1309,128 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
         output = f"{header}\n\n{segment}"
 
         return [TextContent(type="text", text=output)]
+
+    # ====================================================================
+    # get_paper_structure
+    # ====================================================================
+    elif name == "get_paper_structure":
+        paper_key = arguments["paper_key"]
+
+        blocks = pdf_parser.load_content_list(paper_key)
+        if blocks:
+            entries = chunker.extract_structure(blocks)
+            total_pages = max((b.get("page_idx", 0) for b in blocks), default=-1) + 1
+            src = "content_list"
+        else:
+            md = vector_store.get_full_text(paper_key)
+            if md is None:
+                return [TextContent(type="text", text=f"未找到论文 {paper_key} 的解析缓存。请先 ingest_paper。")]
+            entries = chunker.extract_structure_from_markdown(md)
+            total_pages = 0
+            src = "markdown 兜底（无页码）"
+
+        if not entries:
+            return [TextContent(type="text", text=f"论文 {paper_key} 未检测到章节标题。可用 read_paper_full 直接阅读全文。")]
+
+        header = f"## 论文结构 (key={paper_key}, {len(entries)} 节"
+        if total_pages:
+            header += f", {total_pages} 页"
+        header += f", 来源: {src})\n"
+        lines = [header]
+        for e in entries:
+            indent = "  " * max(0, e["level"] - 1)
+            page = f", p{e['page_idx'] + 1}" if e["page_idx"] >= 0 else ""
+            lines.append(f"{indent}- {e['title']}（~{e['char_count']:,} 字{page}）")
+
+        return [TextContent(type="text", text="\n".join(lines))]
+
+    # ====================================================================
+    # get_paper_images
+    # ====================================================================
+    elif name == "get_paper_images":
+        paper_key = arguments["paper_key"]
+        images_dir = config.PARSED_DIR / paper_key / "images"
+        items = []
+
+        blocks = pdf_parser.load_content_list(paper_key)
+        if blocks:
+            for b in blocks:
+                btype = b.get("type")
+                if btype not in ("image", "chart"):
+                    continue
+                img = (b.get("img_path") or "").rsplit("/", 1)[-1]
+                if not img:
+                    continue
+                caps = b.get("image_caption") or b.get("chart_caption") or []
+                items.append({
+                    "path": str(images_dir / img),
+                    "page_idx": b.get("page_idx", 0),
+                    "kind": btype,
+                    "caption": " ".join(c.strip() for c in caps if c.strip()),
+                    "has_description": bool((b.get("content") or "").strip()),
+                    "exists": (images_dir / img).exists(),
+                })
+        else:
+            md = vector_store.get_full_text(paper_key)
+            if md is None and not images_dir.is_dir():
+                return [TextContent(type="text", text=f"未找到论文 {paper_key} 的解析缓存。请先 ingest_paper。")]
+            names: list[str] = []
+            for r in re.findall(r"!\[\]\((?:images/)?([^\s\)]+)\)", md or ""):
+                if r not in names:
+                    names.append(r)
+            if images_dir.is_dir():
+                for f in sorted(images_dir.iterdir()):
+                    if f.is_file() and f.name not in names:
+                        names.append(f.name)
+            for n in names:
+                items.append({
+                    "path": str(images_dir / n), "page_idx": -1,
+                    "kind": "image", "caption": "", "has_description": False,
+                    "exists": (images_dir / n).exists(),
+                })
+
+        if not items:
+            return [TextContent(type="text", text=f"论文 {paper_key} 没有提取到图片。")]
+
+        lines = [f"## 论文图片 (key={paper_key}, {len(items)} 张)", ""]
+        for i, it in enumerate(items, 1):
+            page = f"p{it['page_idx'] + 1} " if it["page_idx"] >= 0 else ""
+            flags = [f"caption: {it['caption'][:80]}"] if it["caption"] else ["无caption"]
+            if it["has_description"]:
+                flags.append("含VLM描述")
+            if not it["exists"]:
+                flags.append("⚠文件缺失")
+            lines.append(f"[{i}] {page}{it['kind']} ({'; '.join(flags)})")
+            lines.append(f"    {it['path']}")
+
+        return [TextContent(type="text", text="\n".join(lines))]
+
+    # ====================================================================
+    # attach_to_zotero
+    # ====================================================================
+    elif name == "attach_to_zotero":
+        item_key = arguments["item_key"]
+        file_path = arguments["file_path"]
+        title = arguments.get("title", "")
+        content_type = arguments.get("content_type", "text/html")
+
+        from pathlib import Path as _P
+        if not _P(file_path).exists():
+            return [TextContent(type="text", text=f"文件不存在: {file_path}")]
+
+        att_key = await _asyncio.to_thread(
+            zotero_sync.create_linked_attachment, item_key, file_path, title, content_type
+        )
+        if att_key is None:
+            return [TextContent(type="text", text=f"附件创建失败（Zotero API 未确认）。请检查条目 key={item_key} 是否存在。")]
+
+        return [TextContent(type="text", text=(
+            f"✅ 附件已挂载到条目 {item_key}\n"
+            f"附件 key: {att_key}\n"
+            f"文件: {file_path}\n"
+            f"在 Zotero 中双击该附件即可用系统默认程序打开。"
+            f"文件本体不上传 Zotero 云端；跨设备访问需文件所在目录走坚果云等外部同步。"
+        ))]
 
     else:
         return [TextContent(type="text", text=f"未知工具: {name}")]

@@ -177,7 +177,7 @@ attach_to_zotero(item_key, html_path, title="AI 解读", content_type="text/html
 |------|------|------|------|
 | **P0 修 bug** ✅ 已完成 (2026-07-22) | 第一节 P0×3 + 轮询响应格式兼容（P1×6 健壮性修复待做） | ✅ 实测通过（见上方修复记录）；>200 页分片与批量配对留待真实批量入库验证 | 实际 0.3 会话 |
 | **P1 结构信号保留** ✅ 已完成 (2026-07-22) | ① `*_content_list.json` 随解析落盘 `parsed/{key}/`；② chunker 新增 `chunk_content_list`（层级只信论文编号不信 text_level、图/表/chart 独立 chunk 不丢弃、caption 去重、页码进 metadata）+ `chunk_auto` 统一入口、md 兜底；③ `read_paper_full` 加 offset/limit 分段 | ✅ 离线测试 4 项全过 + 真实论文（2H42SNB3, vlm 全量解析）验收：112 chunks = 82 text + 10 figure + 20 chart，0 裸图片引用，层级正确；旧缓存无 content_list 自动走 md 兜底。发现并处理：vlm 输出的曲线图是 `chart` 块（非 `image`），20/30 张图差点漏掉 | 实际 0.5 会话 |
-| **P2 解读闭环** | 3 个新 MCP 工具（structure/images/attach）+ 解读 Skill + HTML 模板（MathML + 图片 + CSS） | 挑一篇论文生成"太奶解读"，HTML 里公式/图/caption 正确，Zotero 里双击能打开 | 1-2 会话 |
+| **P2 解读工具闭环** ✅ 已完成 (2026-07-22) | 3 个新 MCP 工具：`get_paper_structure`（章节树，编号层级+页码+节字数）、`get_paper_images`（图片+caption+绝对路径，供多模态读图）、`attach_to_zotero`（linked_file 附件）+ `config.REPORTS_DIR` + SKILL 工作流 | ✅ extract_structure 离线测试（合成块+真实 md 兜底）；attach 回环实测：创建→children 验证→raw HTTP 删除→零残留。按用户决定：**不内置 HTML 模板与解读风格 prompt**（风格归用户，工具归项目） | 实际 0.5 会话 |
 | **P3 批量翻译（可选）** | 移植 stage4_translate，复用智谱 key，入库后自动生成中文译文 HTML 挂附件 | 一篇论文后台翻译完成，术语一致，断点续翻可用 | 1 会话 |
 
 依赖关系：P0 独立且最优先；P1 依赖 P0 的字段修复（否则新解析还是错）；P2 依赖 P1 的 content_list 缓存（旧论文可在 P1 阶段顺手补解析或首次使用时补）；P3 依赖 P2 的 HTML 底座。

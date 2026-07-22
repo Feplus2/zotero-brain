@@ -12,7 +12,7 @@ tags: [academic, zotero, literature, mcp]
 
 ## 概述
 
-Zotero Brain 是一个 MCP Server，提供 11 个工具用于学术文献全生命周期管理。
+Zotero Brain 是一个 MCP Server，提供 14 个工具用于学术文献全生命周期管理。
 核心理念：**Zotero 是用户看到的唯一视图**，ChromaDB 是内部实现细节。
 
 ---
@@ -26,7 +26,7 @@ Zotero Brain 是一个 MCP Server，提供 11 个工具用于学术文献全生�
 ```
 PROJECT_DIR/                       # 项目根目录
 │
-├── mcp_server.py                  # MCP Server 入口（11 个工具）
+├── mcp_server.py                  # MCP Server 入口（14 个工具）
 ├── config.py                      # 路径和 API 配置
 ├── zotero_sync.py                 # Zotero Web API 交互
 ├── paper_discovery.py             # 论文发现（OpenAlex/arXiv/CrossRef/S2）
@@ -49,6 +49,7 @@ PROJECT_DIR/                       # 项目根目录
 ├── data/
 │   ├── chroma_db/                 # ChromaDB 向量数据库
 │   ├── papers/                    # ★ PDF 永久存储（linked_file 指向这里）
+│   ├── reports/                   # Agent 生成的解读/翻译报告（attach_to_zotero 回挂）
 │   ├── downloads/                 # download_paper 的临时下载目录
 │   └── collection_map.json        # 中文名 → ChromaDB slug 映射
 │
@@ -100,7 +101,7 @@ ingest_paper()      →  ★ 确保 PDF 归档到 PAPERS_DIR（自动移动 + �
 
 ---
 
-## MCP 工具清单（11 个）
+## MCP 工具清单（14 个）
 
 ### 搜索类
 | 工具 | 用途 |
@@ -131,7 +132,14 @@ ingest_paper()      →  ★ 确保 PDF 归档到 PAPERS_DIR（自动移动 + �
 |------|------|
 | `get_paper_chunks` | 论文 chunk 目录（结构预览） |
 | `expand_context` | 上下文扩展（围绕特定 chunk 的前后文） |
-| `read_paper_full` | 读全文（从 parsed/ 缓存读，不重新解析 PDF） |
+| `read_paper_full` | 读全文（从 parsed/ 缓存读，支持 offset/limit 分段） |
+| `get_paper_structure` | 章节结构树（编号层级 + 页码 + 节字数，阅读/解读规划用） |
+| `get_paper_images` | 图片清单（caption + 页码 + 绝对路径，供多模态读图） |
+
+### 输出
+| 工具 | 用途 |
+|------|------|
+| `attach_to_zotero` | 把本地文件（如 AI 解读 HTML）挂为条目的 linked_file 附件 |
 
 ---
 
@@ -256,6 +264,21 @@ MinerU 解析时从 PDF 中提取所有图片，保存在 `parsed/{KEY}/images/`
 1. get_bibtex(identifier="10.1038/nature12373", mode="exact")
    → 返回单篇 BibTeX（Zotero 优先 → ChromaDB fallback → CrossRef fallback）
 ```
+
+### 场景 H：生成论文解读/翻译并挂回 Zotero（P2）
+
+工具归项目，风格归用户——解读的语言、深度、风格由你在对话中指定，Agent 自行组织。
+
+```
+1. get_paper_structure(paper_key="KEY") → 章节树（层级/页码/节字数），规划阅读
+2. 按需 read_paper_full(limit=30000) 分段读 / expand_context 精读
+   get_paper_images(paper_key="KEY") → 图片清单，多模态 Agent 按绝对路径看图
+3. Agent 按你指定的风格生成解读/翻译 HTML，保存到 data/reports/{KEY}_xxx.html
+4. attach_to_zotero(item_key="KEY", file_path="...html", title="AI 解读")
+   → Zotero 条目下出现附件，双击用系统默认程序打开
+```
+
+> 报告文件建议放 `data/reports/`（`config.REPORTS_DIR`）；要跨设备打开，需该目录在坚果云同步范围内。
 
 ---
 

@@ -294,6 +294,60 @@ def chunk_content_list(
     return chunks
 
 
+# ============================================================================
+# 章节结构提取（get_paper_structure 工具的数据层）
+# ============================================================================
+
+_MD_HEADING_RE = re.compile(r"^#{1,6}\s+(.+?)\s*#*\s*$", re.MULTILINE)
+
+
+def extract_structure(blocks: list[dict]) -> list[dict]:
+    """
+    从 content_list 提取章节结构（扁平列表，按文档顺序）。
+
+    层级规则与 chunk_content_list 一致：只信论文编号，不信 text_level。
+    返回: [{"level": int, "title": str, "page_idx": int, "char_count": int}, ...]
+    char_count = 该节内容累计字数（含图/表描述，直到下一个标题），供阅读规划参考。
+    """
+    entries: list[dict] = []
+    current = None
+    for b in blocks:
+        btype = b.get("type")
+        if btype in _SKIP_BLOCK_TYPES:
+            continue
+        if btype == "text" and b.get("text_level"):
+            title = _norm_text(b.get("text", ""))
+            if title:
+                current = {
+                    "level": _heading_level(title),
+                    "title": title,
+                    "page_idx": b.get("page_idx", 0),
+                    "char_count": 0,
+                }
+                entries.append(current)
+            continue
+        if current is not None:
+            text = b.get("text") or b.get("content") or b.get("table_body") or ""
+            current["char_count"] += len(_norm_text(text))
+    return entries
+
+
+def extract_structure_from_markdown(markdown_text: str) -> list[dict]:
+    """无 content_list 时的兜底结构提取：按 Markdown 标题 + 编号层级（无页码）。"""
+    matches = list(_MD_HEADING_RE.finditer(markdown_text))
+    entries: list[dict] = []
+    for i, m in enumerate(matches):
+        title = m.group(1).strip()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(markdown_text)
+        entries.append({
+            "level": _heading_level(title),
+            "title": title,
+            "page_idx": -1,
+            "char_count": end - m.end(),
+        })
+    return entries
+
+
 def _split_by_headings(text: str) -> list[tuple[str, str]]:
     """
     按 Markdown 标题切分文本

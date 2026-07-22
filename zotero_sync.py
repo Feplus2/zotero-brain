@@ -417,6 +417,55 @@ def update_linked_file_path(item_key: str, new_path: str, zot=None) -> bool:
     return False
 
 
+def create_linked_attachment(
+    item_key: str,
+    file_path: str,
+    title: str = "",
+    content_type: str = "text/html",
+    zot=None,
+) -> str | None:
+    """
+    在指定条目下创建 linked_file 附件（只链接本地路径，不上传文件本体）。
+
+    用途：把 Agent 生成的解读/翻译报告挂到论文条目上，Zotero 里双击用系统默认程序打开。
+    注意：linked_file 路径仅本机有效；跨设备同步需文件所在目录走坚果云等外部同步。
+
+    Args:
+        item_key: 父条目 Zotero key
+        file_path: 本地文件路径（必须存在）
+        title: 附件显示名（默认用文件名）
+        content_type: MIME 类型（默认 text/html；Markdown 用 text/markdown）
+        zot: Zotero client（可选）
+
+    Returns: 新附件的 key，失败返回 None
+    """
+    from pathlib import Path as _Path
+    p = _Path(file_path)
+    if not p.exists():
+        logger.error(f"附件文件不存在: {file_path}")
+        return None
+    if zot is None:
+        zot = _get_client()
+    payload = {
+        "itemType": "attachment",
+        "linkMode": "linked_file",
+        "path": str(p.resolve()),
+        "contentType": content_type,
+        "title": title or p.name,
+    }
+    try:
+        resp = zot.create_items([payload], parentid=item_key)
+        if resp.get("failed"):
+            logger.error(f"创建 linked 附件失败: {resp['failed']}")
+            return None
+        att_key = resp["success"]["0"]
+        logger.info(f"linked 附件已创建: {att_key} -> {p.name} (parent={item_key})")
+        return att_key
+    except Exception as e:
+        logger.error(f"创建 linked 附件异常: {e}")
+        return None
+
+
 def get_item_fulltext(zot: zotero.Zotero | None = None, item_key: str = "") -> str:
     """
     获取论文的全文内容（Zotero 内置的全文索引）

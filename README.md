@@ -17,7 +17,7 @@ MinerU Cloud API（PDF → 结构化 Markdown）
     ↓
 文本切块 → 智谱 Embedding 向量化 → ChromaDB 向量数据库
     ↓
-MCP Server（11 个工具）
+MCP Server（14 个工具）
     ↓
 AI Agent（WorkBuddy / Cursor / 任何 MCP 兼容客户端）
 ```
@@ -199,7 +199,7 @@ CORE_API_KEY=你的CORE API密钥
 
 ```
 zotero-brain/
-├── mcp_server.py          # MCP Server（11 个工具）
+├── mcp_server.py          # MCP Server（14 个工具）
 ├── zotero_sync.py         # Zotero Web API：文件夹、创建、元数据
 ├── paper_discovery.py     # 学术搜索：OpenAlex/arXiv/CrossRef/Semantic Scholar
 ├── paper_importer.py      # PDF 下载瀑布 + Zotero 导入 + PDF 归档
@@ -215,6 +215,7 @@ zotero-brain/
 ├── data/
 │   ├── chroma_db/         # ChromaDB 向量数据库
 │   ├── papers/            # PDF 永久存储（linked_file 指向这里）
+│   ├── reports/           # Agent 生成的解读/翻译报告（attach_to_zotero 回挂）
 │   ├── downloads/         # PDF 临时下载目录
 │   └── collection_map.json
 │
@@ -248,7 +249,7 @@ ingest_paper()
   → 读 parsed/{key}/{key}.md 缓存，不碰 PDF
 ```
 
-## MCP Server 工具清单（11 个）
+## MCP Server 工具清单（14 个）
 
 ### 搜索
 | 工具 | 用途 |
@@ -280,6 +281,13 @@ ingest_paper()
 | `get_paper_chunks` | 论文结构目录（了解论文长什么样） |
 | `expand_context` | 扩展上下文（深入读特定段落） |
 | `read_paper_full` | 读全文（支持 offset/limit 分段） |
+| `get_paper_structure` | 章节结构树（编号层级 + 页码 + 节字数） |
+| `get_paper_images` | 图片清单（caption + 页码 + 绝对路径） |
+
+### 输出
+| 工具 | 用途 |
+|---|---|
+| `attach_to_zotero` | 把本地文件（如 AI 解读 HTML）挂为条目的 linked_file 附件 |
 
 ## 常见问题
 
