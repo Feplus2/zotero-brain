@@ -48,19 +48,31 @@ def _count_pages(pdf_path: str) -> int | None:
     return None
 
 
-def _get_upload_urls(client: httpx.Client, file_paths: list[str], opts: dict, ocr: bool, pages: str | None) -> str:
+def _get_upload_urls(
+    client: httpx.Client,
+    file_paths: list[str],
+    opts: dict,
+    ocr: bool,
+    pages: str | None = None,
+    data_ids: list[str] | None = None,
+) -> str:
     """
     Request upload URLs for local files and submit extraction task.
     Returns batch_id.
+
+    MinerU v4 API per-file fields: name / is_ocr / data_id / page_ranges.
+    `data_id` is echoed back in batch results and used to pair results with papers.
     """
     files_meta = []
-    for p in file_paths:
+    for i, p in enumerate(file_paths):
         entry = {
             "name": Path(p).name,
             "is_ocr": ocr,
         }
         if pages:
-            entry["data_id"] = pages
+            entry["page_ranges"] = pages
+        if data_ids and data_ids[i]:
+            entry["data_id"] = data_ids[i]
         files_meta.append(entry)
 
     payload = {"files": files_meta, **opts}
@@ -197,11 +209,11 @@ def parse_pdf(
         chunks_needed = max(1, (total_pages + CHUNK_SIZE - 1) // CHUNK_SIZE)
         logger.info(f"  {total_pages} pages, {chunks_needed} chunk(s)")
 
-    # Build options
+    # Build options (MinerU v4 API field names: model_version / enable_formula / enable_table)
     opts = {
-        "model": config.MINERU_MODEL,
-        "formula": True,
-        "table": True,
+        "model_version": config.MINERU_MODEL,
+        "enable_formula": True,
+        "enable_table": True,
         "language": "ch",
     }
 

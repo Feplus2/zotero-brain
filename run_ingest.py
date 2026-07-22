@@ -120,28 +120,33 @@ def _submit_and_wait_batch(
     Returns {item_key: markdown_text | None}.
     """
     opts = {
-        "model": config.MINERU_MODEL,
-        "formula": True,
-        "table": True,
+        "model_version": config.MINERU_MODEL,
+        "enable_formula": True,
+        "enable_table": True,
         "language": "ch",
     }
 
     logger.info(f"  Submitting {len(pdf_paths)} PDFs to MinerU...")
     path_strs = [str(p) for p in pdf_paths]
-    batch_id = pdf_parser._get_upload_urls(client, path_strs, opts, ocr=True, pages=None)
+    # data_id = item_key: echoed back in batch results and used to pair results with papers
+    # (API does NOT guarantee result order — pairing by index can misattribute papers)
+    batch_id = pdf_parser._get_upload_urls(client, path_strs, opts, ocr=True, data_ids=item_keys)
     logger.info(f"  Batch ID: {batch_id}")
 
     # Poll until all done/failed
     deadline = time.monotonic() + MINERU_POLL_TIMEOUT
     interval = 5.0
     results_map: dict[str, str | None] = {}
+    key_set = set(item_keys)
+    name_to_key = {p.name: k for p, k in zip(pdf_paths, item_keys)}
 
     while True:
         resp = client.get(f"{pdf_parser._API_BASE}/extract-results/batch/{batch_id}")
         resp.raise_for_status()
         body = resp.json()
-        if not body.get("success"):
-            raise RuntimeError(f"MinerU polling error: {body.get('message', 'unknown')}")
+        # Support both old format ({success: bool}) and new format ({code: 0})
+        if body.get("code", body.get("success", True)) not in (0, True):
+            raise RuntimeError(f"MinerU polling error: {body.get('msg', body.get('message', 'unknown'))}")
 
         results = body["data"]["extract_result"]
         done_count = sum(1 for r in results if r.get("state") in ("done", "failed"))
@@ -149,21 +154,30 @@ def _submit_and_wait_batch(
         logger.info(f"  Polling: {done_count}/{total} done")
 
         if done_count == total:
-            # Download markdown + images for each result
-            outputs = []
+            # Pair each result to its paper via data_id (fallback: file_name); never by index
             for r in results:
-                if r.get("state") != "done":
-                    outputs.append(("", []))
+                item_key = r.get("data_id")
+                if item_key not in key_set:
+                    item_key = name_to_key.get(r.get("file_name", ""))
+                if item_key is None:
+                    logger.warning(
+                        f"  Result not matched to any paper "
+                        f"(data_id={r.get('data_id')}, file={r.get('file_name')}) - SKIPPED"
+                    )
                     continue
+
+                if r.get("state") != "done":
+                    logger.warning(f"  [{item_key}] parse state={r.get('state')}: {r.get('err_msg', '')}")
+                    results_map[item_key] = None
+                    continue
+
                 try:
                     out = pdf_parser._download_results(client, [r])
-                    outputs.append(out[0] if out else ("", []))
+                    md_text, images = out[0] if out else ("", [])
                 except Exception as e:
-                    logger.warning(f"  Download failed: {e}")
-                    outputs.append(("", []))
+                    logger.warning(f"  [{item_key}] download failed: {e}")
+                    md_text, images = "", []
 
-            for i, (md_text, images) in enumerate(outputs):
-                item_key = item_keys[i]
                 if md_text:
                     cache_dir = config.PARSED_DIR / item_key
                     cache_dir.mkdir(parents=True, exist_ok=True)
