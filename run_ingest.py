@@ -66,13 +66,19 @@ def _get_already_ingested() -> set[str]:
     return keys
 
 
-def _has_cached_parse(item_key: str, pdf_path: Path) -> bool:
-    """检查是否有缓存的解析结果（key 命名优先，向后兼容 stem 命名）"""
-    if (config.PARSED_DIR / item_key / f"{item_key}.md").exists():
-        return True
-    if (config.PARSED_DIR / item_key / f"{pdf_path.stem}.md").exists():
-        return True
-    return False
+def _cached_parse_path(item_key: str, pdf_path: Path) -> Path | None:
+    """返回缓存的解析结果路径（key 命名优先，向后兼容 stem 命名），无缓存返回 None。
+
+    检查与读取必须走同一个函数——曾经"检查接受 stem 命名、读取只认 key 命名"，
+    命中 stem 缓存时 FileNotFoundError 直接崩掉 Phase 1。
+    """
+    for candidate in (
+        config.PARSED_DIR / item_key / f"{item_key}.md",
+        config.PARSED_DIR / item_key / f"{pdf_path.stem}.md",
+    ):
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def _process_paper(item: dict, markdown_text: str) -> dict:
@@ -141,6 +147,54 @@ def _submit_and_wait_batch(
     key_set = set(item_keys)
     name_to_key = {p.name: k for p, k in zip(pdf_paths, item_keys)}
 
+    def _collect_result(r: dict):
+        """按 data_id 配对（file_name 兜底，绝不按下标）→ 下载 → 写缓存。
+        全完成分支和超时 salvage 分支共用。"""
+        item_key = r.get("data_id")
+        if item_key not in key_set:
+            item_key = name_to_key.get(r.get("file_name", ""))
+        if item_key is None:
+            logger.warning(
+                f"  Result not matched to any paper "
+                f"(data_id={r.get('data_id')}, file={r.get('file_name')}) - SKIPPED"
+            )
+            return
+
+        if r.get("state") != "done":
+            logger.warning(f"  [{item_key}] parse state={r.get('state')}: {r.get('err_msg', '')}")
+            results_map[item_key] = None
+            return
+
+        try:
+            out = pdf_parser._download_results(client, [r])
+            md_text, images, content_list = out[0] if out else ("", [], None)
+        except Exception as e:
+            logger.warning(f"  [{item_key}] download failed: {e}")
+            md_text, images, content_list = "", [], None
+
+        if md_text:
+            cache_dir = config.PARSED_DIR / item_key
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_md = cache_dir / f"{item_key}.md"
+            cache_md.write_text(md_text, encoding="utf-8")
+
+            if content_list:
+                (cache_dir / f"{item_key}_content_list.json").write_text(
+                    json.dumps(content_list, ensure_ascii=False), encoding="utf-8"
+                )
+
+            if images:
+                images_dir = cache_dir / "images"
+                images_dir.mkdir(parents=True, exist_ok=True)
+                for img_name, img_data in images:
+                    (images_dir / img_name).write_bytes(img_data)
+
+            results_map[item_key] = md_text
+            logger.info(f"  [{item_key}] done: {len(md_text)} chars")
+        else:
+            logger.warning(f"  [{item_key}] failed or empty")
+            results_map[item_key] = None
+
     while True:
         resp = client.get(f"{pdf_parser._API_BASE}/extract-results/batch/{batch_id}")
         resp.raise_for_status()
@@ -155,56 +209,16 @@ def _submit_and_wait_batch(
         logger.info(f"  Polling: {done_count}/{total} done")
 
         if done_count == total:
-            # Pair each result to its paper via data_id (fallback: file_name); never by index
             for r in results:
-                item_key = r.get("data_id")
-                if item_key not in key_set:
-                    item_key = name_to_key.get(r.get("file_name", ""))
-                if item_key is None:
-                    logger.warning(
-                        f"  Result not matched to any paper "
-                        f"(data_id={r.get('data_id')}, file={r.get('file_name')}) - SKIPPED"
-                    )
-                    continue
-
-                if r.get("state") != "done":
-                    logger.warning(f"  [{item_key}] parse state={r.get('state')}: {r.get('err_msg', '')}")
-                    results_map[item_key] = None
-                    continue
-
-                try:
-                    out = pdf_parser._download_results(client, [r])
-                    md_text, images, content_list = out[0] if out else ("", [], None)
-                except Exception as e:
-                    logger.warning(f"  [{item_key}] download failed: {e}")
-                    md_text, images, content_list = "", [], None
-
-                if md_text:
-                    cache_dir = config.PARSED_DIR / item_key
-                    cache_dir.mkdir(parents=True, exist_ok=True)
-                    cache_md = cache_dir / f"{item_key}.md"
-                    cache_md.write_text(md_text, encoding="utf-8")
-
-                    if content_list:
-                        (cache_dir / f"{item_key}_content_list.json").write_text(
-                            json.dumps(content_list, ensure_ascii=False), encoding="utf-8"
-                        )
-
-                    if images:
-                        images_dir = cache_dir / "images"
-                        images_dir.mkdir(parents=True, exist_ok=True)
-                        for img_name, img_data in images:
-                            (images_dir / img_name).write_bytes(img_data)
-
-                    results_map[item_key] = md_text
-                    logger.info(f"  [{item_key}] done: {len(md_text)} chars")
-                else:
-                    logger.warning(f"  [{item_key}] failed or empty")
-                    results_map[item_key] = None
+                _collect_result(r)
             break
 
         if time.monotonic() > deadline:
-            logger.error(f"  MinerU batch timeout ({MINERU_POLL_TIMEOUT}s)")
+            # 超时 salvage：已完成的结果照常下载缓存，不浪费已花掉的解析配额
+            logger.error(f"  MinerU batch timeout ({MINERU_POLL_TIMEOUT}s), salvaging completed results")
+            for r in results:
+                if r.get("state") == "done":
+                    _collect_result(r)
             for key in item_keys:
                 if key not in results_map:
                     results_map[key] = None
@@ -298,8 +312,8 @@ def run(
             continue
 
         # Check cache
-        if not force_parse and _has_cached_parse(key, pdf_path):
-            cache_md = config.PARSED_DIR / key / f"{key}.md"
+        cache_md = _cached_parse_path(key, pdf_path) if not force_parse else None
+        if cache_md:
             md = cache_md.read_text(encoding="utf-8")
             if md.strip():
                 cached[key] = (item, md)

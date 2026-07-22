@@ -11,7 +11,7 @@ Sources (by priority):
 Unified return format:
   {
     "title": "...",
-    "authors": ["Last First", ...],
+    "authors": ["First Last", ...],
     "year": 2025,
     "doi": "10.xxx/...",
     "abstract": "...",

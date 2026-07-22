@@ -368,7 +368,12 @@ def create_collection(
             old_col = client.get_collection(old_slug)
             old_data = old_col.get(include=["embeddings", "documents", "metadatas"])
             if old_data["ids"]:
-                new_col = client.get_or_create_collection(name=chroma_name)
+                # hnsw:space 只在创建时生效，创建时必须带 metadata（否则新库退回默认 l2，
+                # 与其他 cosine 库打分口径不一致）
+                new_col = client.get_or_create_collection(
+                    name=chroma_name,
+                    metadata={"hnsw:space": "cosine", "display_name": collection_name},
+                )
                 new_col.upsert(
                     ids=old_data["ids"],
                     embeddings=old_data["embeddings"],

@@ -360,7 +360,7 @@ async def list_tools() -> list[Tool]:
                     "authors": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "作者列表（可选，格式: ['Last First', ...]）",
+                        "description": "作者列表（可选，格式: ['First Last', ...]，最后一个词为姓）",
                     },
                     "year": {
                         "type": "integer",

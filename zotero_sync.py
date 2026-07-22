@@ -352,15 +352,19 @@ def download_pdf(
             if not filename:
                 filename = f"{pdf_key}.pdf"
 
+            before = set(papers_dir.iterdir())
             zot.dump(pdf_key, str(papers_dir))
 
             expected = papers_dir / filename
             if expected.exists() and expected.stat().st_size > 1000:
                 logger.info(f"PDF downloaded from Zotero API: {expected}")
                 return expected
-            # Fallback: scan for any new PDF (backward compat with renamed files)
+            # Fallback: 只认本次下载新出现的 PDF，绝不拿 papers/ 里的存量文件
+            # （否则会把别人的 PDF 错配给本条目）
             for f in papers_dir.iterdir():
-                if f.suffix == ".pdf" and f.stat().st_size > 1000:
+                if f in before:
+                    continue
+                if f.suffix.lower() == ".pdf" and f.stat().st_size > 1000:
                     logger.info(f"PDF downloaded from Zotero API (scan): {f}")
                     return f
         except Exception as e:
@@ -591,7 +595,7 @@ def get_item_metadata(identifier: str, zot: zotero.Zotero | None = None) -> dict
     Returns: {
         "key": "ABC123",
         "title": "...",
-        "authors": ["Last First", ...],
+        "authors": ["First Last", ...],
         "year": 2024,
         "doi": "10.1038/...",
         "url": "...",

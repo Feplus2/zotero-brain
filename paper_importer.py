@@ -518,24 +518,19 @@ def _find_in_zotero(doi: str, title: str = "") -> str | None:
 
 
 def _parse_authors(author_list: list[str]) -> list[dict]:
-    """Convert 'Last First' or 'First Last' format to pyzotero creator format."""
+    """Convert display names ("First Last") to pyzotero creator format.
+
+    OpenAlex/S2/CrossRef/arXiv 的 display_name 统一是 "First Last" 顺序，
+    最后一个 token 是姓（此前 2-token 名按 "Last First" 解析，姓名写反，污染 BibTeX）。
+    """
     creators = []
     for name in author_list:
         parts = name.strip().split()
         if len(parts) >= 2:
-            # Assume last token is surname (Last First format is more common in academic DBs)
-            # Also handle First Last format
-            if len(parts) == 2:
-                # "Last First" or "First Last" - ambiguous, conservatively use last token as given name
-                last = parts[0]
-                first = " ".join(parts[1:])
-            else:
-                last = parts[-1]
-                first = " ".join(parts[:-1])
             creators.append({
                 "creatorType": "author",
-                "firstName": first,
-                "lastName": last,
+                "firstName": " ".join(parts[:-1]),
+                "lastName": parts[-1],
             })
         elif parts:
             creators.append({
