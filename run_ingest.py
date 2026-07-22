@@ -92,7 +92,8 @@ def _process_paper(item: dict, markdown_text: str) -> dict:
         "issue": item.get("issue", ""),
         "pages": item.get("pages", ""),
     }
-    chunks = chunker.chunk_markdown(markdown_text, paper_metadata=paper_metadata)
+    content_list = pdf_parser.load_content_list(key)
+    chunks = chunker.chunk_auto(markdown_text, content_list=content_list, paper_metadata=paper_metadata)
     if not chunks:
         logger.warning(f"  {key}: no chunks")
         return {"added": 0, "skipped": 0, "skipped_details": []}
@@ -173,16 +174,21 @@ def _submit_and_wait_batch(
 
                 try:
                     out = pdf_parser._download_results(client, [r])
-                    md_text, images = out[0] if out else ("", [])
+                    md_text, images, content_list = out[0] if out else ("", [], None)
                 except Exception as e:
                     logger.warning(f"  [{item_key}] download failed: {e}")
-                    md_text, images = "", []
+                    md_text, images, content_list = "", [], None
 
                 if md_text:
                     cache_dir = config.PARSED_DIR / item_key
                     cache_dir.mkdir(parents=True, exist_ok=True)
                     cache_md = cache_dir / f"{item_key}.md"
                     cache_md.write_text(md_text, encoding="utf-8")
+
+                    if content_list:
+                        (cache_dir / f"{item_key}_content_list.json").write_text(
+                            json.dumps(content_list, ensure_ascii=False), encoding="utf-8"
+                        )
 
                     if images:
                         images_dir = cache_dir / "images"

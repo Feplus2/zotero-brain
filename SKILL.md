@@ -42,6 +42,7 @@ PROJECT_DIR/                       # 项目根目录
 ├── parsed/                        # ★ MinerU 解析缓存（核心！）
 │   └── {KEY}/                     # 以 Zotero item key 命名
 │       ├── {KEY}.md               # 结构化 Markdown 全文
+│       ├── {KEY}_content_list.json # MinerU 块级结构（标题/图注/表格/页码/bbox，P1 起随解析缓存）
 │       ├── images/                # 从 PDF 提取的图片（hash 命名）
 │       └── {KEY}.pdf              # 偶有一份 PDF 副本
 │
@@ -224,7 +225,7 @@ MinerU 解析时从 PDF 中提取所有图片，保存在 `parsed/{KEY}/images/`
 1. search_papers(query="关键词") → 找到相关论文和 chunk
 2. get_paper_chunks(paper_key="KEY") → 看论文结构目录
 3. expand_context(paper_key="KEY", chunk_index=N, prev=2, next=3) → 精读特定段落
-4. read_paper_full(paper_key="KEY") → 需要全文时（token 消耗大，慎用）
+4. read_paper_full(paper_key="KEY", limit=30000) → 需要全文时分段读（按返回头部的 offset 提示续读）
 ```
 
 ### 场景 E：拿论文配图做 PPT / 报告
@@ -304,5 +305,5 @@ ChromaDB 只接受 `[a-z0-9._-]`（3-512 字符，首尾必须 a-z0-9）。
 3. **Collection 映射** — 中英文映射由 `create_collection` 工具写入 `collection_map.json`
 4. **网络要求** — MinerU（国内）必须直连不走代理；OpenAlex/Unpaywall/CrossRef/Zotero（境外）需要代理。`network_helper.py` 会自动处理 MinerU 的直连绕过
 5. **download_paper 优先用 DOI** — `discover_papers` 返回的每条候选都有 DOI。调用 `download_paper` 时一律用 `doi` 参数定位论文，禁止仅用 `title` 搜索后盲取首个结果。`title` 参数仅作为元数据标签辅助使用。
-6. **read_paper_full 只在用户明确要求时使用** — 平时优先使用 `get_paper_chunks` + `expand_context` 定位需要的段落，但在用户指定读全文时必须读完论文全部内容。
+6. **read_paper_full 只在用户明确要求时使用** — 平时优先使用 `get_paper_chunks` + `expand_context` 定位需要的段落；读全文时用 `limit` 分段（如 30000 字），按返回头部的 offset 提示续读，用户指定读全文时必须读完全部内容。
 7. **PDF 可能货不对板** — 即使 DOI 正确，部分数据源（如 CORE、Sci-Hub）偶尔返回错误论文的 PDF。`download_paper` 已内置元数据标题校验，不匹配时会自动丢弃并尝试下一个源。如果所有源均因校验失败或下载失败而耗尽，告知用户并建议手动下载。导入和入库前请再次确认 PDF 内容与预期论文一致。

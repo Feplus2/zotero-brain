@@ -9,6 +9,7 @@ import logging
 
 import config
 import chunker
+import pdf_parser
 import vector_store
 import zotero_sync
 
@@ -87,7 +88,8 @@ def main():
             "issue": item.get("issue", ""),
             "pages": item.get("pages", ""),
         }
-        chunks = chunker.chunk_markdown(markdown_text, paper_metadata=paper_metadata)
+        content_list = pdf_parser.load_content_list(key)
+        chunks = chunker.chunk_auto(markdown_text, content_list=content_list, paper_metadata=paper_metadata)
         if not chunks:
             logger.warning(f"  切块为空，跳过")
             continue

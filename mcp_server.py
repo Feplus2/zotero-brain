@@ -120,7 +120,8 @@ def _ingest_paper(
         "issue": item.get("issue", ""),
         "pages": item.get("pages", ""),
     }
-    chunks = chunker.chunk_markdown(markdown_text, paper_metadata=paper_metadata)
+    content_list = pdf_parser.load_content_list(key)
+    chunks = chunker.chunk_auto(markdown_text, content_list=content_list, paper_metadata=paper_metadata)
     if not chunks:
         return {"added": 0, "skipped": 0, "skipped_details": []}
 
@@ -542,13 +543,23 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="read_paper_full",
-            description="读取某篇论文的完整 Markdown 文本（从解析缓存中读取，不重新解析 PDF）。用于需要高精确度、绕过嵌入模型直接在 LLM 上下文中阅读全文的场景。返回文本量较大，仅在精准讨论单篇论文时使用。",
+            description="读取某篇论文的完整 Markdown 文本（从解析缓存中读取，不重新解析 PDF）。用于需要高精确度、绕过嵌入模型直接在 LLM 上下文中阅读全文的场景。返回文本量较大，建议用 offset/limit 分段读取（如每次 30000 字）。",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "paper_key": {
                         "type": "string",
                         "description": "Zotero 论文 key",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "起始字符位置（默认 0，从头开始）",
+                        "default": 0,
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "最多返回字符数（默认 0 = 返回全部）。全文较长时建议分段，如 30000",
+                        "default": 0,
                     },
                 },
                 "required": ["paper_key"],
@@ -1216,8 +1227,28 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
         if full_text is None:
             return [TextContent(type="text", text=f"未找到论文 {paper_key} 的解析缓存。请确认该论文已入库（parsed/ 目录下应有 {paper_key}.md）。")]
 
-        char_count = len(full_text)
-        output = f"## 论文全文 (key={paper_key}, {char_count} 字)\n\n{full_text}"
+        try:
+            offset = max(0, int(arguments.get("offset") or 0))
+            limit = max(0, int(arguments.get("limit") or 0))
+        except (TypeError, ValueError):
+            return [TextContent(type="text", text="参数错误: offset/limit 必须是整数")]
+
+        total = len(full_text)
+        if offset >= total:
+            return [TextContent(type="text", text=f"offset={offset} 超出全文长度（共 {total} 字）。")]
+
+        segment = full_text[offset:] if limit <= 0 else full_text[offset:offset + limit]
+        if offset + len(segment) < total:
+            # 在段落边界截断，避免半句话
+            cut = segment.rfind("\n\n", int(len(segment) * 0.8))
+            if cut > 0:
+                segment = segment[:cut]
+        end = offset + len(segment)
+
+        header = f"## 论文全文 (key={paper_key}, 共 {total} 字，返回 {offset}–{end})"
+        if end < total:
+            header += f"\n> 未读完，继续：read_paper_full(paper_key=\"{paper_key}\", offset={end})"
+        output = f"{header}\n\n{segment}"
 
         return [TextContent(type="text", text=output)]
 

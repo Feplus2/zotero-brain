@@ -9,6 +9,7 @@ Features:
   - Auto-retry on network errors
 """
 
+import json
 import logging
 import time
 from pathlib import Path
@@ -128,10 +129,10 @@ def _wait_for_batch(client: httpx.Client, batch_id: str, timeout: int = 600) -> 
         interval = min(interval * 2, _POLL_INTERVAL_MAX)
 
 
-def _download_results(client: httpx.Client, results: list[dict]) -> list[tuple[str, list[tuple[str, bytes]]]]:
+def _download_results(client: httpx.Client, results: list[dict]) -> list[tuple[str, list[tuple[str, bytes]], list | None]]:
     """
-    Download markdown and images for completed results.
-    Returns list of (markdown_text, [(image_name, image_bytes), ...]).
+    Download markdown, images and content_list for completed results.
+    Returns list of (markdown_text, [(image_name, image_bytes), ...], content_list | None).
     """
     import zipfile
     import io
@@ -143,8 +144,9 @@ def _download_results(client: httpx.Client, results: list[dict]) -> list[tuple[s
 
         md_text = ""
         images = []
+        content_list = None
 
-        # New API: full_zip_url contains everything (md + images)
+        # New API: full_zip_url contains everything (md + images + JSON)
         zip_url = r.get("full_zip_url") or r.get("markdown_url")
         if zip_url:
             zip_resp = client.get(zip_url)
@@ -153,6 +155,11 @@ def _download_results(client: httpx.Client, results: list[dict]) -> list[tuple[s
                 for name in zf.namelist():
                     if name.endswith(".md") and not md_text:
                         md_text = zf.read(name).decode("utf-8")
+                    elif name.endswith("_content_list.json") and content_list is None:
+                        try:
+                            content_list = json.loads(zf.read(name).decode("utf-8"))
+                        except Exception as e:
+                            logger.warning(f"  content_list parse failed ({name}): {e}")
                     elif name.rsplit(".", 1)[-1].lower() in ("png", "jpg", "jpeg", "gif", "svg"):
                         images.append((Path(name).name, zf.read(name)))
 
@@ -165,8 +172,24 @@ def _download_results(client: httpx.Client, results: list[dict]) -> list[tuple[s
                     img_resp.raise_for_status()
                     images.append((Path(img_url).name, img_resp.content))
 
-        outputs.append((md_text, images))
+        outputs.append((md_text, images, content_list))
     return outputs
+
+
+def load_content_list(item_key: str) -> list | None:
+    """Load cached MinerU content_list (v1) from parsed/{key}/, None if absent.
+
+    content_list 提供块级结构（type/text/text_level/page_idx/bbox/图注配对），
+    是 chunker 块级切块与后续结构化功能的数据来源。
+    """
+    p = config.PARSED_DIR / item_key / f"{item_key}_content_list.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning(f"content_list load failed for {item_key}: {e}")
+        return None
 
 
 def parse_pdf(
@@ -253,8 +276,14 @@ def parse_pdf(
                     if not outputs:
                         raise RuntimeError("No results returned")
 
-                    md_text, images = outputs[0]
+                    md_text, images, content_list = outputs[0]
                     all_markdown.append(md_text)
+
+                    # Save content_list（块级结构，供 chunker / 结构化功能使用）
+                    if content_list:
+                        (cache_dir / f"{item_key or pdf_path.stem}_content_list.json").write_text(
+                            json.dumps(content_list, ensure_ascii=False), encoding="utf-8"
+                        )
 
                     # Save images
                     if images:
