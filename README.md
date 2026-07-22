@@ -279,7 +279,7 @@ ingest_paper()
 |---|---|
 | `get_paper_chunks` | 论文结构目录（了解论文长什么样） |
 | `expand_context` | 扩展上下文（深入读特定段落） |
-| `read_paper_full` | 读全文 |
+| `read_paper_full` | 读全文（支持 offset/limit 分段） |
 
 ## 常见问题
 
