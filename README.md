@@ -1,5 +1,7 @@
 # Zotero Brain
 
+> ⚠️ **本仓库已停止维护（2026-08）**：功能已精简重写为 [**zotero-brain-slim**](https://github.com/Feplus2/zotero-brain-slim)——多源开放学术检索 + 合法 OA 下载 + Zotero 库同步，MCP/CLI 双模，并可与 [Better SageRead](https://github.com/Feplus2/better-sageread) 阅读器一键对接。**新用户请直接使用精简版**，本仓库仅作历史存档。
+
 > 让你的 Zotero 文献库变成可语义搜索、可 AI 对话的活知识库。
 
 > **For AI Agents:** 如果你是通过 MCP 使用本项目的 AI Agent，请先阅读 [SKILL.md](SKILL.md)。它包含项目架构、文件布局、操作规范和场景速查，能帮你避免常见错误（如找不到 PDF、重复下载、混淆缓存路径等）。
